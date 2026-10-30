@@ -1,0 +1,522 @@
+package display_test
+
+import (
+	"testing"
+
+	"github.com/hari-incoming/hazdo/internal/provider"
+	"github.com/hari-incoming/hazdo/internal/ui/display"
+	"github.com/hari-incoming/hazdo/internal/ui/styles"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// ─── StateCategory ───────────────────────────────────────────────────────────
+
+func TestStateGlyph(t *testing.T) {
+	tests := []struct {
+		name     string
+		cat      provider.StateCategory
+		expected string
+	}{
+		{"Unknown", provider.StateCategoryUnknown, "○"},
+		{"New", provider.StateCategoryNew, "○"},
+		{"Active", provider.StateCategoryActive, "◐"},
+		{"Resolved", provider.StateCategoryResolved, "●"},
+		{"ReadyForTest", provider.StateCategoryReadyForTest, "●"},
+		{"ClosedDone", provider.StateCategoryClosedDone, "✓"},
+		{"Removed", provider.StateCategoryRemoved, "✗"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.StateGlyph(tc.cat)
+			if got != tc.expected {
+				t.Errorf("StateGlyph(%v) = %q, want %q", tc.cat, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestStateLabel(t *testing.T) {
+	tests := []struct {
+		name     string
+		cat      provider.StateCategory
+		expected string
+	}{
+		// Unknown and ReadyForTest return "" (caller uses raw state string)
+		{"Unknown", provider.StateCategoryUnknown, ""},
+		{"New", provider.StateCategoryNew, "New"},
+		{"Active", provider.StateCategoryActive, "Active"},
+		{"Resolved", provider.StateCategoryResolved, "Resolved"},
+		{"ReadyForTest", provider.StateCategoryReadyForTest, ""},
+		{"ClosedDone", provider.StateCategoryClosedDone, "Closed"},
+		{"Removed", provider.StateCategoryRemoved, "Removed"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.StateLabel(tc.cat)
+			if got != tc.expected {
+				t.Errorf("StateLabel(%v) = %q, want %q", tc.cat, got, tc.expected)
+			}
+		})
+	}
+}
+
+// ─── ItemType ────────────────────────────────────────────────────────────────
+
+func TestItemTypeLabel(t *testing.T) {
+	tests := []struct {
+		name     string
+		itemType provider.ItemType
+		expected string
+	}{
+		{"Unknown", provider.ItemTypeUnknown, "Item"},
+		{"Bug", provider.ItemTypeBug, "Bug"},
+		{"Task", provider.ItemTypeTask, "Task"},
+		{"UserStory", provider.ItemTypeUserStory, "Story"},
+		{"Feature", provider.ItemTypeFeature, "Feature"},
+		{"Epic", provider.ItemTypeEpic, "Epic"},
+		{"Issue", provider.ItemTypeIssue, "Issue"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.ItemTypeLabel(tc.itemType)
+			if got != tc.expected {
+				t.Errorf("ItemTypeLabel(%v) = %q, want %q", tc.itemType, got, tc.expected)
+			}
+		})
+	}
+}
+
+// ─── VoteKind ────────────────────────────────────────────────────────────────
+
+func TestVoteGlyph(t *testing.T) {
+	tests := []struct {
+		name     string
+		vote     provider.VoteKind
+		expected string
+	}{
+		{"NoVote", provider.VoteKindNoVote, "○"},
+		{"Approved", provider.VoteKindApproved, "✓"},
+		{"ApprovedWithSuggestions", provider.VoteKindApprovedWithSuggestions, "~"},
+		{"WaitingForAuthor", provider.VoteKindWaitingForAuthor, "◐"},
+		{"Rejected", provider.VoteKindRejected, "✗"},
+		// Sentinel: out-of-range value falls through to default
+		{"OutOfRange", provider.VoteKind(99), "?"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.VoteGlyph(tc.vote)
+			if got != tc.expected {
+				t.Errorf("VoteGlyph(%v) = %q, want %q", tc.vote, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestVoteLabel(t *testing.T) {
+	tests := []struct {
+		name     string
+		vote     provider.VoteKind
+		expected string
+	}{
+		{"NoVote", provider.VoteKindNoVote, "No vote"},
+		{"Approved", provider.VoteKindApproved, "Approved"},
+		{"ApprovedWithSuggestions", provider.VoteKindApprovedWithSuggestions, "Approved with suggestions"},
+		{"WaitingForAuthor", provider.VoteKindWaitingForAuthor, "Waiting for author"},
+		{"Rejected", provider.VoteKindRejected, "Rejected"},
+		{"OutOfRange", provider.VoteKind(99), "Unknown"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.VoteLabel(tc.vote)
+			if got != tc.expected {
+				t.Errorf("VoteLabel(%v) = %q, want %q", tc.vote, got, tc.expected)
+			}
+		})
+	}
+}
+
+// ─── RunStatus ───────────────────────────────────────────────────────────────
+
+func TestRunStatusGlyph(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   provider.RunStatus
+		expected string
+	}{
+		// RunStatusUnknown → "○" matching the detail view's default/unknown case
+		{"Unknown", provider.RunStatusUnknown, "○"},
+		{"Running", provider.RunStatusRunning, "●"},
+		{"Queued", provider.RunStatusQueued, "○"},
+		{"Canceling", provider.RunStatusCanceling, "⊘"},
+		{"Succeeded", provider.RunStatusSucceeded, "✓"},
+		{"Failed", provider.RunStatusFailed, "✗"},
+		{"Canceled", provider.RunStatusCanceled, "○"},
+		{"PartiallySucceeded", provider.RunStatusPartiallySucceeded, "◐"},
+		// Detail-view-only statuses
+		{"Pending", provider.RunStatusPending, "○"},
+		{"SucceededWithIssues", provider.RunStatusSucceededWithIssues, "◐"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.RunStatusGlyph(tc.status)
+			if got != tc.expected {
+				t.Errorf("RunStatusGlyph(%v) = %q, want %q", tc.status, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestRunStatusLabel(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   provider.RunStatus
+		expected string
+	}{
+		{"Unknown", provider.RunStatusUnknown, ""},
+		{"Running", provider.RunStatusRunning, "Running"},
+		{"Queued", provider.RunStatusQueued, "Queued"},
+		{"Canceling", provider.RunStatusCanceling, "Cancel"},
+		{"Succeeded", provider.RunStatusSucceeded, "Success"},
+		{"Failed", provider.RunStatusFailed, "Failed"},
+		{"Canceled", provider.RunStatusCanceled, "Cancel"},
+		{"PartiallySucceeded", provider.RunStatusPartiallySucceeded, "Partial"},
+		// Detail-view-only statuses have no list label
+		{"Pending", provider.RunStatusPending, ""},
+		{"SucceededWithIssues", provider.RunStatusSucceededWithIssues, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.RunStatusLabel(tc.status)
+			if got != tc.expected {
+				t.Errorf("RunStatusLabel(%v) = %q, want %q", tc.status, got, tc.expected)
+			}
+		})
+	}
+}
+
+// ─── Kind ────────────────────────────────────────────────────────────────────
+
+func TestKindGlyph(t *testing.T) {
+	tests := []struct {
+		name     string
+		kind     provider.Kind
+		expected string
+	}{
+		// Zero/unknown Kind returns a neutral fallback; no constant exists for it yet.
+		{"Zero", provider.Kind(0), "?"},
+		{"Azure", provider.KindAzure, "⬢"},
+		{"GitHub", provider.KindGitHub, "⎇"},
+		// Sentinel: out-of-range value falls through to default
+		{"OutOfRange", provider.Kind(99), "?"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.KindGlyph(tc.kind)
+			if got != tc.expected {
+				t.Errorf("KindGlyph(%v) = %q, want %q", tc.kind, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestKindLabel(t *testing.T) {
+	tests := []struct {
+		name     string
+		kind     provider.Kind
+		expected string
+	}{
+		// Zero/unknown Kind returns "" (caller decides how to handle unknown origin).
+		{"Zero", provider.Kind(0), ""},
+		{"Azure", provider.KindAzure, "Azure"},
+		{"GitHub", provider.KindGitHub, "GitHub"},
+		// Sentinel: out-of-range value falls through to default
+		{"OutOfRange", provider.Kind(99), ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.KindLabel(tc.kind)
+			if got != tc.expected {
+				t.Errorf("KindLabel(%v) = %q, want %q", tc.kind, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestKindStyle(t *testing.T) {
+	s := styles.DefaultStyles()
+	th := s.Theme
+	tests := []struct {
+		name   string
+		kind   provider.Kind
+		wantFg lipgloss.Color
+	}{
+		// All kinds (including zero/unknown and KindAzure) use Muted so the glyph
+		// reads as secondary metadata rather than a status indicator.
+		{"Zero", provider.Kind(0), th.ForegroundMuted},
+		{"Azure", provider.KindAzure, th.ForegroundMuted},
+		{"GitHub", provider.KindGitHub, th.ForegroundMuted},
+		// Sentinel: out-of-range value also returns Muted
+		{"OutOfRange", provider.Kind(99), th.ForegroundMuted},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.KindStyle(tc.kind, s).GetForeground()
+			if got != tc.wantFg {
+				t.Errorf("KindStyle(%v) foreground = %v, want %v", tc.kind, got, tc.wantFg)
+			}
+		})
+	}
+}
+
+// ─── MixedKinds ──────────────────────────────────────────────────────────────
+
+func TestMixedKinds(t *testing.T) {
+	tests := []struct {
+		name     string
+		kinds    []provider.Kind
+		expected bool
+	}{
+		// empty → false
+		{"Empty", []provider.Kind{}, false},
+		// single element, single kind → false
+		{"SingleKind_OneElement", []provider.Kind{provider.KindAzure}, false},
+		// multiple elements, all same kind → false
+		{"SingleKind_MultipleElements", []provider.Kind{provider.KindAzure, provider.KindAzure, provider.KindAzure}, false},
+		// two distinct kinds → true
+		{"TwoDistinctKinds", []provider.Kind{provider.KindAzure, provider.Kind(2)}, true},
+		// more than two distinct kinds → true
+		{"ThreeDistinctKinds", []provider.Kind{provider.KindAzure, provider.Kind(2), provider.Kind(3)}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.MixedKinds(tc.kinds)
+			if got != tc.expected {
+				t.Errorf("MixedKinds(%v) = %v, want %v", tc.kinds, got, tc.expected)
+			}
+		})
+	}
+}
+
+// ─── MultiScope ──────────────────────────────────────────────────────────────
+
+// TestMultiScope mirrors TestMixedKinds for the notifications pane's dynamic
+// Repo column predicate. The empty-slice row is load-bearing rather than
+// decorative: listview.New calls ToColumns(nil) to derive the initial column
+// specs (listview.go:110 documents relying on MixedKinds([]) == false for
+// exactly this), so a MultiScope that reported true for an empty slice would
+// build the table with a Repo column that the first single-repo ToRows call
+// then has no cell for — a table.renderRow panic (convention 7).
+func TestMultiScope(t *testing.T) {
+	tests := []struct {
+		name     string
+		scopes   []string
+		expected bool
+	}{
+		// nil → false (the ToColumns(nil) path listview.New takes)
+		{"Nil", nil, false},
+		// empty (non-nil) → false
+		{"Empty", []string{}, false},
+		// single element → false
+		{"OneElement", []string{"owner/repo"}, false},
+		// several elements, all the same scope → false
+		{"AllSame", []string{"owner/repo", "owner/repo", "owner/repo"}, false},
+		// several elements, all the empty scope → false (an absent repository
+		// payload on every row is still a single scope, not a multi-repo feed)
+		{"AllEmptyString", []string{"", "", ""}, false},
+		// two distinct scopes → true
+		{"TwoDistinct", []string{"owner/repo1", "owner/repo2"}, true},
+		// an absent repository payload alongside a real scope is still two
+		// distinct scopes → true
+		{"EmptyPlusNonEmpty", []string{"", "owner/repo"}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.MultiScope(tc.scopes)
+			if got != tc.expected {
+				t.Errorf("MultiScope(%q) = %v, want %v", tc.scopes, got, tc.expected)
+			}
+		})
+	}
+}
+
+// ─── Style function tests ─────────────────────────────────────────────────────
+
+func TestStateStyle(t *testing.T) {
+	s := styles.DefaultStyles()
+	th := s.Theme
+	tests := []struct {
+		name   string
+		cat    provider.StateCategory
+		wantFg lipgloss.Color
+	}{
+		{"Unknown", provider.StateCategoryUnknown, th.ForegroundMuted},
+		{"New", provider.StateCategoryNew, th.ForegroundMuted},
+		{"Active", provider.StateCategoryActive, th.Info},
+		{"Resolved", provider.StateCategoryResolved, th.Warning},
+		{"ReadyForTest", provider.StateCategoryReadyForTest, th.Secondary},
+		{"ClosedDone", provider.StateCategoryClosedDone, th.Success},
+		{"Removed", provider.StateCategoryRemoved, th.Error},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.StateStyle(tc.cat, s).GetForeground()
+			if got != tc.wantFg {
+				t.Errorf("StateStyle(%v) foreground = %v, want %v", tc.cat, got, tc.wantFg)
+			}
+		})
+	}
+}
+
+func TestItemTypeStyle(t *testing.T) {
+	s := styles.DefaultStyles()
+	th := s.Theme
+	tests := []struct {
+		name     string
+		itemType provider.ItemType
+		wantFg   lipgloss.Color
+	}{
+		{"Unknown", provider.ItemTypeUnknown, th.ForegroundMuted},
+		{"Bug", provider.ItemTypeBug, th.Error},
+		{"Task", provider.ItemTypeTask, th.Info},
+		{"UserStory", provider.ItemTypeUserStory, th.Success},
+		{"Feature", provider.ItemTypeFeature, th.Accent},
+		{"Epic", provider.ItemTypeEpic, th.Warning},
+		{"Issue", provider.ItemTypeIssue, th.Error},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.ItemTypeStyle(tc.itemType, s).GetForeground()
+			if got != tc.wantFg {
+				t.Errorf("ItemTypeStyle(%v) foreground = %v, want %v", tc.itemType, got, tc.wantFg)
+			}
+		})
+	}
+}
+
+func TestVoteStyle(t *testing.T) {
+	s := styles.DefaultStyles()
+	th := s.Theme
+	tests := []struct {
+		name   string
+		vote   provider.VoteKind
+		wantFg lipgloss.Color
+	}{
+		{"NoVote", provider.VoteKindNoVote, th.ForegroundMuted},
+		{"Approved", provider.VoteKindApproved, th.Success},
+		{"ApprovedWithSuggestions", provider.VoteKindApprovedWithSuggestions, th.Warning},
+		{"WaitingForAuthor", provider.VoteKindWaitingForAuthor, th.Warning},
+		{"Rejected", provider.VoteKindRejected, th.Error},
+		{"OutOfRange", provider.VoteKind(99), th.ForegroundMuted},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.VoteStyle(tc.vote, s).GetForeground()
+			if got != tc.wantFg {
+				t.Errorf("VoteStyle(%v) foreground = %v, want %v", tc.vote, got, tc.wantFg)
+			}
+		})
+	}
+}
+
+func TestRunStatusStyle(t *testing.T) {
+	s := styles.DefaultStyles()
+	th := s.Theme
+	tests := []struct {
+		name   string
+		status provider.RunStatus
+		wantFg lipgloss.Color
+	}{
+		{"Unknown", provider.RunStatusUnknown, th.ForegroundMuted},
+		{"Running", provider.RunStatusRunning, th.Info},
+		{"Queued", provider.RunStatusQueued, th.Info},
+		{"Canceling", provider.RunStatusCanceling, th.Warning},
+		{"Succeeded", provider.RunStatusSucceeded, th.Success},
+		{"Failed", provider.RunStatusFailed, th.Error},
+		{"Canceled", provider.RunStatusCanceled, th.ForegroundMuted},
+		{"PartiallySucceeded", provider.RunStatusPartiallySucceeded, th.Warning},
+		{"Pending", provider.RunStatusPending, th.ForegroundMuted},
+		{"SucceededWithIssues", provider.RunStatusSucceededWithIssues, th.Warning},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := display.RunStatusStyle(tc.status, s).GetForeground()
+			if got != tc.wantFg {
+				t.Errorf("RunStatusStyle(%v) foreground = %v, want %v", tc.status, got, tc.wantFg)
+			}
+		})
+	}
+}
+
+// ─── NotificationReason ──────────────────────────────────────────────────────
+
+// TestNotificationReasonGlyphAndStyle covers all 12 declared values (spec
+// Decision 18) plus one out-of-range value, per convention 6: it asserts the
+// glyph, the exact label, and the named style's foreground color — not a
+// label substring or a non-emptiness check.
+func TestNotificationReasonGlyphAndStyle(t *testing.T) {
+	s := styles.DefaultStyles()
+	th := s.Theme
+	tests := []struct {
+		name      string
+		reason    provider.NotificationReason
+		wantGlyph string
+		wantLabel string
+		wantFg    lipgloss.Color
+	}{
+		{"Unknown", provider.NotificationReasonUnknown, "?", "Unknown", th.ForegroundMuted},
+		{"ReviewRequested", provider.NotificationReasonReviewRequested, "◐", "Review requested", th.Warning},
+		{"Mentioned", provider.NotificationReasonMentioned, "@", "Mentioned", th.Info},
+		{"Assigned", provider.NotificationReasonAssigned, "●", "Assigned", th.Warning},
+		{"Authored", provider.NotificationReasonAuthored, "✎", "Authored", th.Info},
+		{"Commented", provider.NotificationReasonCommented, "»", "Commented", th.Info},
+		{"StateChanged", provider.NotificationReasonStateChanged, "⇄", "State changed", th.Info},
+		{"CIActivity", provider.NotificationReasonCIActivity, "▶", "CI activity", th.Info},
+		{"SecurityAlert", provider.NotificationReasonSecurityAlert, "⚠", "Security alert", th.Error},
+		{"ApprovalRequested", provider.NotificationReasonApprovalRequested, "◉", "Approval requested", th.Warning},
+		{"Subscribed", provider.NotificationReasonSubscribed, "◇", "Subscribed", th.ForegroundMuted},
+		{"Other", provider.NotificationReasonOther, "•", "Other", th.ForegroundMuted},
+		// Sentinel: an out-of-range value must render as Other, never empty.
+		{"OutOfRange", provider.NotificationReason(99), "•", "Other", th.ForegroundMuted},
+	}
+
+	seenGlyphs := map[string]bool{}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotGlyph := display.NotificationReasonGlyph(tc.reason)
+			if gotGlyph != tc.wantGlyph {
+				t.Errorf("NotificationReasonGlyph(%v) = %q, want %q", tc.reason, gotGlyph, tc.wantGlyph)
+			}
+			if gotGlyph == "" {
+				t.Errorf("NotificationReasonGlyph(%v) must never be empty", tc.reason)
+			}
+			// The out-of-range sentinel deliberately reuses Other's glyph, so
+			// it is excluded from the distinctness check below.
+			if tc.name != "OutOfRange" {
+				if seenGlyphs[gotGlyph] {
+					t.Errorf("NotificationReasonGlyph(%v) = %q is not distinct — another declared reason already uses this glyph", tc.reason, gotGlyph)
+				}
+				seenGlyphs[gotGlyph] = true
+			}
+
+			gotFg := display.NotificationReasonStyle(tc.reason, s).GetForeground()
+			if gotFg != tc.wantFg {
+				t.Errorf("NotificationReasonStyle(%v) foreground = %v, want %v", tc.reason, gotFg, tc.wantFg)
+			}
+
+			if label := display.NotificationReasonLabel(tc.reason); label != tc.wantLabel {
+				t.Errorf("NotificationReasonLabel(%v) = %q, want %q", tc.reason, label, tc.wantLabel)
+			}
+		})
+	}
+}
+
+// TestNotificationReasonLabel_OutOfRangeIsOther pins that an unrecognised
+// value renders as the same label as the declared Other value, matching the
+// glyph/style fallback above.
+func TestNotificationReasonLabel_OutOfRangeIsOther(t *testing.T) {
+	got := display.NotificationReasonLabel(provider.NotificationReason(99))
+	want := display.NotificationReasonLabel(provider.NotificationReasonOther)
+	if got != want {
+		t.Errorf("NotificationReasonLabel(out-of-range) = %q, want %q (same as Other)", got, want)
+	}
+}

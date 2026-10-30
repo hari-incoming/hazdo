@@ -1,0 +1,236 @@
+package polling
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/hari-incoming/hazdo/internal/provider"
+)
+
+// MockClient implements a minimal interface for testing
+type MockClient struct {
+	Runs         []provider.PipelineRun
+	Err          error
+	CallCount    int
+	RequestedTop int
+}
+
+func (m *MockClient) ListPipelineRuns(top int, _ provider.ListOpts) ([]provider.PipelineRun, error) {
+	m.CallCount++
+	m.RequestedTop = top
+	return m.Runs, m.Err
+}
+
+// Compile-time check: the composite provider must satisfy PipelineClient.
+var _ PipelineClient = (*provider.CompositeProvider)(nil)
+
+func TestPoller_DefaultInterval(t *testing.T) {
+	client := &MockClient{}
+	p := NewPoller(client, 0) // 0 should use default
+
+	if p.interval != DefaultInterval {
+		t.Errorf("expected default interval %v, got %v", DefaultInterval, p.interval)
+	}
+}
+
+func TestPoller_MinimumInterval(t *testing.T) {
+	client := &MockClient{}
+	p := NewPoller(client, 1*time.Second) // Too short
+
+	if p.interval < MinInterval {
+		t.Errorf("interval %v should not be less than MinInterval %v", p.interval, MinInterval)
+	}
+}
+
+func TestPoller_FetchPipelineRuns_Success(t *testing.T) {
+	expectedRuns := []provider.PipelineRun{
+		{Identity: provider.Identity{ID: "1"}, BuildNumber: "2024.1"},
+		{Identity: provider.Identity{ID: "2"}, BuildNumber: "2024.2"},
+	}
+	client := &MockClient{Runs: expectedRuns}
+	p := NewPoller(client, 30*time.Second)
+
+	// Get the command
+	cmd := p.FetchPipelineRuns()
+	if cmd == nil {
+		t.Fatal("expected non-nil command")
+	}
+
+	// Execute the command to get the message
+	msg := cmd()
+
+	// Verify the message type and content
+	runsMsg, ok := msg.(PipelineRunsUpdated)
+	if !ok {
+		t.Fatalf("expected PipelineRunsUpdated, got %T", msg)
+	}
+
+	if runsMsg.Err != nil {
+		t.Errorf("expected no error, got %v", runsMsg.Err)
+	}
+	if len(runsMsg.Runs) != 2 {
+		t.Errorf("expected 2 runs, got %d", len(runsMsg.Runs))
+	}
+	if client.CallCount != 1 {
+		t.Errorf("expected 1 API call, got %d", client.CallCount)
+	}
+}
+
+func TestPoller_FetchPipelineRuns_Error(t *testing.T) {
+	expectedErr := errors.New("network error")
+	client := &MockClient{Err: expectedErr}
+	p := NewPoller(client, 30*time.Second)
+
+	cmd := p.FetchPipelineRuns()
+	msg := cmd()
+
+	runsMsg, ok := msg.(PipelineRunsUpdated)
+	if !ok {
+		t.Fatalf("expected PipelineRunsUpdated, got %T", msg)
+	}
+
+	if runsMsg.Err == nil {
+		t.Error("expected error, got nil")
+	}
+	if runsMsg.Err.Error() != "network error" {
+		t.Errorf("expected 'network error', got '%s'", runsMsg.Err.Error())
+	}
+	if runsMsg.Runs != nil {
+		t.Error("expected nil runs on error")
+	}
+}
+
+func TestPoller_StartPolling_RespectsStopState(t *testing.T) {
+	client := &MockClient{}
+	p := NewPoller(client, 30*time.Second)
+
+	cmd := p.StartPolling()
+	if cmd == nil {
+		t.Error("StartPolling should return a command when running")
+	}
+
+	p.Stop()
+
+	cmd = p.StartPolling()
+	if cmd != nil {
+		t.Error("StartPolling should return nil when stopped")
+	}
+}
+
+func TestPoller_OnTick_RespectsStopState(t *testing.T) {
+	client := &MockClient{}
+	p := NewPoller(client, 30*time.Second)
+
+	cmd := p.OnTick()
+	if cmd == nil {
+		t.Error("OnTick should return a command when running")
+	}
+
+	p.Stop()
+
+	cmd = p.OnTick()
+	if cmd != nil {
+		t.Error("OnTick should return nil when stopped")
+	}
+}
+
+func TestPoller_SetInterval_EnforcesMinimum(t *testing.T) {
+	client := &MockClient{}
+	p := NewPoller(client, 30*time.Second)
+
+	p.SetInterval(1 * time.Second) // Too short
+	if p.interval < MinInterval {
+		t.Errorf("interval %v should not be less than MinInterval %v", p.interval, MinInterval)
+	}
+}
+
+func TestPoller_IsStopped(t *testing.T) {
+	client := &MockClient{}
+	p := NewPoller(client, 30*time.Second)
+
+	if p.IsStopped() {
+		t.Error("expected poller to not be stopped initially")
+	}
+
+	p.Stop()
+	if !p.IsStopped() {
+		t.Error("expected poller to be stopped after Stop()")
+	}
+}
+
+func TestPoller_FetchPipelineRuns_WhenStopped(t *testing.T) {
+	client := &MockClient{}
+	p := NewPoller(client, 30*time.Second)
+	p.Stop()
+
+	cmd := p.FetchPipelineRuns()
+	if cmd != nil {
+		t.Error("FetchPipelineRuns should return nil when stopped")
+	}
+	if client.CallCount != 0 {
+		t.Error("API should not be called when poller is stopped")
+	}
+}
+
+func TestPoller_RequestedRunCount(t *testing.T) {
+	client := &MockClient{}
+	p := NewPoller(client, 30*time.Second)
+
+	cmd := p.FetchPipelineRuns()
+	cmd()
+
+	// Default should request 25 runs (matching current behavior)
+	if client.RequestedTop != DefaultRunCount {
+		t.Errorf("expected to request %d runs, got %d", DefaultRunCount, client.RequestedTop)
+	}
+}
+
+func TestPoller_CustomRunCount(t *testing.T) {
+	client := &MockClient{}
+	p := NewPoller(client, 30*time.Second)
+	p.SetRunCount(50)
+
+	cmd := p.FetchPipelineRuns()
+	cmd()
+
+	if client.RequestedTop != 50 {
+		t.Errorf("expected to request 50 runs, got %d", client.RequestedTop)
+	}
+}
+
+// TestPoller_NilClient_* guards against the typed-nil boxed-interface panic that
+// occurs when a GitHub-only user has no Azure backend. The poller must no-op
+// (return nil / skip fetch) rather than panic when client == nil.
+
+func TestPoller_NilClient_FetchPipelineRuns_ReturnsNil(t *testing.T) {
+	var pc PipelineClient // untyped nil — interface value is genuinely nil
+	p := NewPoller(pc, 30*time.Second)
+
+	cmd := p.FetchPipelineRuns()
+	if cmd != nil {
+		t.Error("FetchPipelineRuns should return nil when client is nil")
+	}
+}
+
+func TestPoller_NilClient_OnTick_ReturnsNil(t *testing.T) {
+	var pc PipelineClient
+	p := NewPoller(pc, 30*time.Second)
+
+	cmd := p.OnTick()
+	if cmd != nil {
+		t.Error("OnTick should return nil when client is nil")
+	}
+}
+
+func TestPoller_NilClient_StartPolling_StillWorks(t *testing.T) {
+	// StartPolling only sets a timer; it does not touch client.
+	// It must still return a non-nil cmd when the poller is not stopped.
+	var pc PipelineClient
+	p := NewPoller(pc, 30*time.Second)
+
+	cmd := p.StartPolling()
+	if cmd == nil {
+		t.Error("StartPolling should return a timer command even when client is nil")
+	}
+}

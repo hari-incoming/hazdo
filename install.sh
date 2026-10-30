@@ -1,0 +1,512 @@
+#!/bin/sh
+# install.sh - Install Hazdo from GitHub releases
+#
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/hari-incoming/hazdo/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/hari-incoming/hazdo/main/install.sh | sh -s -- --version v0.1.0
+#   ./install.sh
+#   ./install.sh --version v0.1.0
+#   ./install.sh --install-dir /custom/path
+
+set -e
+
+# ─── Configuration ─────────────────────────────────────────────────────────────
+
+REPO_OWNER="hari-incoming"
+REPO_NAME="hazdo"
+BINARY_NAME="azdo"
+CONFIG_DIR_NAME="azdo-tui"
+GITHUB_API="https://api.github.com"
+GITHUB_DOWNLOAD="https://github.com"
+
+# Defaults (can be overridden by flags)
+INSTALL_DIR=""
+VERSION=""
+
+# ─── Output helpers ────────────────────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+info() {
+    printf "${BLUE}[INFO]${NC}  %s\n" "$1"
+}
+
+success() {
+    printf "${GREEN}[OK]${NC}    %s\n" "$1"
+}
+
+warn() {
+    printf "${YELLOW}[WARN]${NC}  %s\n" "$1"
+}
+
+error() {
+    printf "${RED}[ERROR]${NC} %s\n" "$1" >&2
+}
+
+step() {
+    printf "\n${CYAN}${BOLD}==> %s${NC}\n" "$1"
+}
+
+# ─── Parse arguments ──────────────────────────────────────────────────────────
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --version|-v)
+                VERSION="$2"
+                shift 2
+                ;;
+            --install-dir|-d)
+                INSTALL_DIR="$2"
+                shift 2
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+usage() {
+    cat <<EOF
+Usage: install.sh [OPTIONS]
+
+Install Hazdo from GitHub releases (the executable command is azdo).
+
+Options:
+  --version, -v VERSION     Install a specific version (e.g., v0.1.0)
+                            Default: latest release
+  --install-dir, -d DIR     Custom installation directory
+                            Default: /usr/local/bin (or ~/.local/bin as fallback)
+  --help, -h                Show this help message
+
+Examples:
+  # Install latest version
+  curl -fsSL https://raw.githubusercontent.com/hari-incoming/hazdo/main/install.sh | sh
+
+  # Install specific version
+  ./install.sh --version v0.1.0
+
+  # Install to custom directory
+  ./install.sh --install-dir ~/bin
+EOF
+}
+
+# ─── OS / Architecture detection ──────────────────────────────────────────────
+
+detect_os() {
+    OS="$(uname -s)"
+    case "$OS" in
+        Linux*)   OS_NAME="Linux"   ;;
+        Darwin*)  OS_NAME="Darwin"  ;;
+        MINGW*|MSYS*|CYGWIN*)
+            OS_NAME="Windows"
+            ;;
+        *)
+            error "Unsupported operating system: $OS"
+            error "Hazdo supports Linux, macOS, and Windows."
+            error "For Windows, consider using the PowerShell installer (install.ps1) instead."
+            exit 1
+            ;;
+    esac
+    success "Detected OS: $OS_NAME"
+}
+
+detect_arch() {
+    ARCH="$(uname -m)"
+    case "$ARCH" in
+        x86_64|amd64)   ARCH_NAME="x86_64" ;;
+        aarch64|arm64)  ARCH_NAME="arm64"   ;;
+        *)
+            error "Unsupported architecture: $ARCH"
+            error "Hazdo supports x86_64 (amd64) and arm64 (aarch64)."
+            exit 1
+            ;;
+    esac
+    success "Detected architecture: $ARCH_NAME"
+}
+
+detect_wsl() {
+    kernel_release_file="${1:-/proc/sys/kernel/osrelease}"
+    IS_WSL="false"
+    WSL_DISTRO="${WSL_DISTRO_NAME:-}"
+
+    if [ -n "${WSL_DISTRO_NAME:-}" ] || [ -n "${WSL_INTEROP:-}" ]; then
+        IS_WSL="true"
+    elif [ -r "$kernel_release_file" ] && grep -qi "microsoft" "$kernel_release_file"; then
+        IS_WSL="true"
+    fi
+
+    if [ "$IS_WSL" = "true" ]; then
+        if [ -z "$WSL_DISTRO" ]; then
+            WSL_DISTRO="${DISTRO_NAME:-WSL}"
+        fi
+        success "Running inside WSL: $WSL_DISTRO"
+    else
+        info "Not running inside WSL"
+    fi
+}
+
+detect_linux_distribution() {
+    os_release_file="${1:-/etc/os-release}"
+    kernel_release_file="${2:-/proc/sys/kernel/osrelease}"
+    DISTRO_ID="unknown"
+    DISTRO_VERSION="unknown"
+    DISTRO_NAME="Unknown Linux distribution"
+
+    if [ -r "$os_release_file" ]; then
+        DISTRO_ID=$(sed -n 's/^ID=//p' "$os_release_file" | sed -n '1p' | sed 's/^"//; s/"$//')
+        DISTRO_VERSION=$(sed -n 's/^VERSION_ID=//p' "$os_release_file" | sed -n '1p' | sed 's/^"//; s/"$//')
+        DISTRO_NAME=$(sed -n 's/^PRETTY_NAME=//p' "$os_release_file" | sed -n '1p' | sed 's/^"//; s/"$//')
+        DISTRO_ID="${DISTRO_ID:-unknown}"
+        DISTRO_VERSION="${DISTRO_VERSION:-unknown}"
+        DISTRO_NAME="${DISTRO_NAME:-$DISTRO_ID}"
+        success "Detected Linux distribution: $DISTRO_NAME ($DISTRO_ID $DISTRO_VERSION)"
+    else
+        warn "Could not read $os_release_file; using the generic Linux build."
+    fi
+
+    detect_wsl "$kernel_release_file"
+}
+
+# ─── Dependency checks ────────────────────────────────────────────────────────
+
+check_dependencies() {
+    # We need either curl or wget for downloading
+    if command -v curl >/dev/null 2>&1; then
+        DOWNLOADER="curl"
+    elif command -v wget >/dev/null 2>&1; then
+        DOWNLOADER="wget"
+    else
+        error "Neither 'curl' nor 'wget' found."
+        error "Please install one of them and try again:"
+        error "  - Ubuntu/Debian: sudo apt install curl"
+        error "  - Fedora/RHEL:   sudo dnf install curl"
+        error "  - macOS:         curl is pre-installed"
+        exit 1
+    fi
+    success "Using downloader: $DOWNLOADER"
+
+    # We need tar for extracting (unless Windows .zip)
+    if [ "$OS_NAME" != "Windows" ]; then
+        if ! command -v tar >/dev/null 2>&1; then
+            error "'tar' is required for extracting the archive but was not found."
+            error "Please install tar and try again."
+            exit 1
+        fi
+    fi
+
+    # sha256sum or shasum for checksum verification
+    if command -v sha256sum >/dev/null 2>&1; then
+        SHA_CMD="sha256sum"
+    elif command -v shasum >/dev/null 2>&1; then
+        SHA_CMD="shasum -a 256"
+    else
+        warn "Neither 'sha256sum' nor 'shasum' found. Skipping checksum verification."
+        SHA_CMD=""
+    fi
+}
+
+# ─── Download helper ──────────────────────────────────────────────────────────
+
+download() {
+    url="$1"
+    output="$2"
+
+    if [ "$DOWNLOADER" = "curl" ]; then
+        curl -fsSL -o "$output" "$url"
+    else
+        wget -q -O "$output" "$url"
+    fi
+}
+
+download_to_stdout() {
+    url="$1"
+
+    if [ "$DOWNLOADER" = "curl" ]; then
+        curl -fsSL "$url"
+    else
+        wget -q -O - "$url"
+    fi
+}
+
+# ─── Version resolution ───────────────────────────────────────────────────────
+
+resolve_version() {
+    if [ -n "$VERSION" ]; then
+        # Ensure version starts with 'v'
+        case "$VERSION" in
+            v*) ;;
+            *)  VERSION="v$VERSION" ;;
+        esac
+        success "Using specified version: $VERSION"
+        return
+    fi
+
+    info "Fetching latest release version..."
+
+    LATEST_URL="$GITHUB_API/repos/$REPO_OWNER/$REPO_NAME/releases/latest"
+    RESPONSE=$(download_to_stdout "$LATEST_URL" 2>&1) || {
+        error "Failed to fetch latest release from GitHub."
+        error "This could mean:"
+        error "  - No releases have been published yet"
+        error "  - GitHub API rate limit exceeded (try again later)"
+        error "  - Network connectivity issues"
+        error ""
+        error "You can specify a version manually: ./install.sh --version v0.1.0"
+        error "Check available releases at: $GITHUB_DOWNLOAD/$REPO_OWNER/$REPO_NAME/releases"
+        exit 1
+    }
+
+    # Extract tag_name from JSON response (works without jq)
+    VERSION=$(printf '%s' "$RESPONSE" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | grep -o '"[^"]*"$' | tr -d '"')
+
+    if [ -z "$VERSION" ]; then
+        error "Could not determine the latest version."
+        error "The GitHub API response may have changed or no releases exist."
+        error ""
+        error "You can specify a version manually: ./install.sh --version v0.1.0"
+        error "Check available releases at: $GITHUB_DOWNLOAD/$REPO_OWNER/$REPO_NAME/releases"
+        exit 1
+    fi
+
+    success "Latest version: $VERSION"
+}
+
+# ─── Install directory resolution ─────────────────────────────────────────────
+
+resolve_install_dir() {
+    if [ -n "$INSTALL_DIR" ]; then
+        success "Using custom install directory: $INSTALL_DIR"
+        return
+    fi
+
+    if [ "$OS_NAME" = "Windows" ]; then
+        # On Windows (MSYS/Git Bash), install to user's local bin
+        INSTALL_DIR="$HOME/.local/bin"
+    elif [ "$(id -u)" = "0" ]; then
+        # Running as root
+        INSTALL_DIR="/usr/local/bin"
+    elif [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
+        INSTALL_DIR="/usr/local/bin"
+    else
+        # Fallback to user-local directory
+        INSTALL_DIR="$HOME/.local/bin"
+        if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
+            warn "$INSTALL_DIR is not in your PATH."
+            warn "Add it by appending this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
+            warn "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+        fi
+    fi
+
+    success "Install directory: $INSTALL_DIR"
+}
+
+# ─── Download and install ─────────────────────────────────────────────────────
+
+download_and_install() {
+    # Determine archive extension
+    if [ "$OS_NAME" = "Windows" ]; then
+        ARCHIVE_EXT="zip"
+    else
+        ARCHIVE_EXT="tar.gz"
+    fi
+
+    # Strip leading 'v' from version for the archive filename
+    VERSION_NUM="${VERSION#v}"
+
+    ARCHIVE_NAME="${BINARY_NAME}_${VERSION_NUM}_${OS_NAME}_${ARCH_NAME}.${ARCHIVE_EXT}"
+    DOWNLOAD_URL="$GITHUB_DOWNLOAD/$REPO_OWNER/$REPO_NAME/releases/download/$VERSION/$ARCHIVE_NAME"
+    CHECKSUMS_URL="$GITHUB_DOWNLOAD/$REPO_OWNER/$REPO_NAME/releases/download/$VERSION/checksums.txt"
+
+    info "Downloading $ARCHIVE_NAME..."
+
+    # Create temporary directory
+    TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'azdo-install')
+    trap 'rm -rf "$TMP_DIR"' EXIT
+
+    download "$DOWNLOAD_URL" "$TMP_DIR/$ARCHIVE_NAME" || {
+        error "Failed to download $ARCHIVE_NAME"
+        error ""
+        error "Possible causes:"
+        error "  - Version $VERSION may not exist"
+        error "  - The release may not include a build for $OS_NAME/$ARCH_NAME"
+        error "  - Network connectivity issues"
+        error ""
+        error "Check available releases at:"
+        error "  $GITHUB_DOWNLOAD/$REPO_OWNER/$REPO_NAME/releases"
+        exit 1
+    }
+
+    success "Downloaded $ARCHIVE_NAME"
+
+    # Verify checksum if possible
+    if [ -n "$SHA_CMD" ]; then
+        info "Verifying checksum..."
+        download "$CHECKSUMS_URL" "$TMP_DIR/checksums.txt" 2>/dev/null && {
+            EXPECTED=$(grep "$ARCHIVE_NAME" "$TMP_DIR/checksums.txt" | awk '{print $1}')
+            if [ -n "$EXPECTED" ]; then
+                ACTUAL=$(cd "$TMP_DIR" && $SHA_CMD "$ARCHIVE_NAME" | awk '{print $1}')
+                if [ "$EXPECTED" = "$ACTUAL" ]; then
+                    success "Checksum verified"
+                else
+                    error "Checksum verification failed!"
+                    error "  Expected: $EXPECTED"
+                    error "  Got:      $ACTUAL"
+                    error "The downloaded file may be corrupted. Please try again."
+                    exit 1
+                fi
+            else
+                warn "Archive not found in checksums file. Skipping verification."
+            fi
+        } || {
+            warn "Could not download checksums file. Skipping verification."
+        }
+    fi
+
+    # Extract archive
+    info "Extracting archive..."
+    if [ "$ARCHIVE_EXT" = "zip" ]; then
+        if command -v unzip >/dev/null 2>&1; then
+            unzip -o -q "$TMP_DIR/$ARCHIVE_NAME" -d "$TMP_DIR/extracted"
+        else
+            error "'unzip' is required to extract the Windows archive but was not found."
+            exit 1
+        fi
+    else
+        mkdir -p "$TMP_DIR/extracted"
+        tar -xzf "$TMP_DIR/$ARCHIVE_NAME" -C "$TMP_DIR/extracted"
+    fi
+
+    success "Extracted archive"
+
+    # Find the binary in extracted files
+    if [ "$OS_NAME" = "Windows" ]; then
+        BINARY_FILE="$BINARY_NAME.exe"
+    else
+        BINARY_FILE="$BINARY_NAME"
+    fi
+
+    EXTRACTED_BINARY=$(find "$TMP_DIR/extracted" -name "$BINARY_FILE" -type f 2>/dev/null | head -1)
+    if [ -z "$EXTRACTED_BINARY" ]; then
+        error "Could not find '$BINARY_FILE' in the extracted archive."
+        error "The archive contents may have changed. Please report this issue at:"
+        error "  https://github.com/$REPO_OWNER/$REPO_NAME/issues"
+        exit 1
+    fi
+
+    # Create install directory if needed
+    if [ ! -d "$INSTALL_DIR" ]; then
+        info "Creating install directory: $INSTALL_DIR"
+        mkdir -p "$INSTALL_DIR" 2>/dev/null || {
+            error "Failed to create directory: $INSTALL_DIR"
+            error ""
+            error "Possible fixes:"
+            error "  - Run with sudo: curl ... | sudo sh"
+            error "  - Use a custom directory: ./install.sh --install-dir ~/bin"
+            error "  - Create the directory manually: mkdir -p $INSTALL_DIR"
+            exit 1
+        }
+    fi
+
+    # Install the binary
+    info "Installing $BINARY_FILE to $INSTALL_DIR..."
+    cp "$EXTRACTED_BINARY" "$INSTALL_DIR/$BINARY_FILE" 2>/dev/null || {
+        error "Failed to copy binary to $INSTALL_DIR/$BINARY_FILE"
+        error ""
+        error "Possible fixes:"
+        error "  - Run with sudo: curl ... | sudo sh"
+        error "  - Use a custom directory: ./install.sh --install-dir ~/bin"
+        error "  - Check permissions: ls -la $INSTALL_DIR"
+        exit 1
+    }
+
+    chmod +x "$INSTALL_DIR/$BINARY_FILE" 2>/dev/null || true
+
+    resign_macos_binary "$INSTALL_DIR/$BINARY_FILE"
+
+    success "Installed $BINARY_FILE to $INSTALL_DIR/$BINARY_FILE"
+}
+
+# ─── macOS re-sign ────────────────────────────────────────────────────────────
+
+# Replace the binary's linker-signed signature with a real ad-hoc signature.
+# macOS Sequoia+ kills binaries that only carry the linker-signed flag, which
+# is what Go's linker stamps onto cross-compiled darwin builds. This is a
+# safety net for archives that were not re-signed at release time.
+resign_macos_binary() {
+    binary_path="$1"
+
+    if [ "$OS_NAME" != "Darwin" ]; then
+        return 0
+    fi
+
+    if ! command -v codesign >/dev/null 2>&1; then
+        warn "codesign not found — skipping macOS re-sign step."
+        warn "If '$BINARY_NAME' is killed on launch, run: codesign --sign - --force '$binary_path'"
+        return 0
+    fi
+
+    info "Re-signing binary for macOS..."
+    if codesign --sign - --force "$binary_path" >/dev/null 2>&1; then
+        success "Re-signed binary"
+    else
+        warn "codesign failed — binary may still be killed by macOS on launch."
+        warn "Try manually: codesign --sign - --force '$binary_path'"
+    fi
+}
+
+# ─── Summary ───────────────────────────────────────────────────────────────────
+
+print_summary() {
+    printf "\n"
+    printf "${GREEN}${BOLD}────────────────────────────────────────────────${NC}\n"
+    printf "${GREEN}${BOLD}  Hazdo %s installed successfully!${NC}\n" "$VERSION"
+    printf "${GREEN}${BOLD}────────────────────────────────────────────────${NC}\n"
+    printf "\n"
+
+    printf "  Next step: run ${CYAN}%s${NC} and follow the first-run setup wizard.\n" "$BINARY_NAME"
+    printf "\n"
+    printf "  ${BOLD}Documentation:${NC} https://github.com/$REPO_OWNER/$REPO_NAME#readme\n"
+    printf "\n"
+}
+
+# ─── Main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    printf "\n${BOLD}Hazdo installer${NC}\n"
+    printf "Azure DevOps TUI for your terminal\n\n"
+
+    parse_args "$@"
+
+    step "Detecting system"
+    detect_os
+    if [ "$OS_NAME" = "Linux" ]; then
+        detect_linux_distribution
+    fi
+    detect_arch
+    check_dependencies
+
+    step "Resolving version"
+    resolve_version
+    resolve_install_dir
+
+    step "Downloading and installing"
+    download_and_install
+
+    print_summary
+}
+
+main "$@"

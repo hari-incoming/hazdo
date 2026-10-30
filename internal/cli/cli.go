@@ -1,0 +1,60 @@
+package cli
+
+// Action represents the CLI action to perform.
+type Action int
+
+const (
+	ActionRun      Action = iota // Default: run the TUI
+	ActionAuth                   // azdo auth: re-set PAT
+	ActionConfig                 // azdo config: update configuration
+	ActionHelp                   // azdo --help: show help
+	ActionVersion                // azdo --version: show version
+	ActionDemo                   // azdo demo: run with mock data
+	ActionAzureCLI               // Azure DevOps CLI commands
+)
+
+// String returns the string representation of an Action.
+func (a Action) String() string {
+	switch a {
+	case ActionRun:
+		return "run"
+	case ActionAuth:
+		return "auth"
+	case ActionConfig:
+		return "config"
+	case ActionHelp:
+		return "help"
+	case ActionVersion:
+		return "version"
+	case ActionDemo:
+		return "demo"
+	case ActionAzureCLI:
+		return "azure"
+	default:
+		return "unknown"
+	}
+}
+
+// ParseArgs parses command-line arguments and returns the action to perform.
+func ParseArgs(args []string) Action {
+	if len(args) < 2 {
+		return ActionRun
+	}
+
+	switch args[1] {
+	case "auth":
+		return ActionAuth
+	case "config":
+		return ActionConfig
+	case "--help", "-h", "help":
+		return ActionHelp
+	case "--version", "-v", "version":
+		return ActionVersion
+	case "demo":
+		return ActionDemo
+	case "pipeline", "pr":
+		return ActionAzureCLI
+	default:
+		return ActionRun
+	}
+}

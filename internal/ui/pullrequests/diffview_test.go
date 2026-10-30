@@ -1,0 +1,1552 @@
+package pullrequests
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/hari-incoming/hazdo/internal/diff"
+	"github.com/hari-incoming/hazdo/internal/provider"
+	"github.com/hari-incoming/hazdo/internal/ui/styles"
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+func newTestDiffModel() *DiffModel {
+	pr := provider.PullRequest{
+		Identity:       provider.Identity{Kind: provider.KindAzure, Scope: "proj", ID: "101"},
+		Title:          "Test PR",
+		SourceRefName:  "refs/heads/feature/test",
+		TargetRefName:  "refs/heads/main",
+		RepositoryID:   "repo-123",
+		RepositoryName: "test-repo",
+	}
+	threads := []provider.Thread{
+		{
+			Identity: provider.Identity{ID: "1"},
+			Status:   "active",
+			FilePath: "/src/main.go",
+			Line:     10,
+			Comments: []provider.Comment{
+				{Identity: provider.Identity{ID: "1"}, Content: "Fix this", AuthorName: "Alice"},
+			},
+		},
+	}
+	s := styles.DefaultStyles()
+	return NewDiffModel(nil, pr, threads, s)
+}
+
+// When an IterationChange carries a unified-diff patch (GitHub), fetchFileDiff
+// must parse it directly — no client, no content fetch — so deleted files and
+// search-sourced PRs (whose branch refs may be unavailable) still render. Uses
+// the nil-client model from newTestDiffModel to prove the client is not touched.
+func TestDiffModel_FetchFileDiff_UsesPatchWithoutClient(t *testing.T) {
+	m := newTestDiffModel() // client is nil
+
+	change := provider.IterationChange{
+		Path:       "deleted.txt",
+		ChangeType: "delete",
+		Patch:      "@@ -1,2 +0,0 @@\n-line one\n-line two",
+	}
+
+	cmd := m.fetchFileDiff(change)
+	if cmd == nil {
+		t.Fatal("fetchFileDiff returned nil cmd")
+	}
+	msg, ok := cmd().(fileDiffMsg)
+	if !ok {
+		t.Fatalf("msg type = %T, want fileDiffMsg", cmd())
+	}
+	if msg.err != nil {
+		t.Fatalf("err = %v, want nil (patch path needs no client)", msg.err)
+	}
+	if msg.diff == nil || len(msg.diff.Hunks) != 1 {
+		t.Fatalf("diff = %+v, want one hunk parsed from the patch", msg.diff)
+	}
+	if msg.diff.ChangeType != "delete" {
+		t.Errorf("ChangeType = %q, want delete", msg.diff.ChangeType)
+	}
+}
+
+func TestNewDiffModel(t *testing.T) {
+	m := newTestDiffModel()
+
+	if m.viewMode != DiffFileList {
+		t.Errorf("Initial viewMode = %d, want DiffFileList", m.viewMode)
+	}
+	if m.loading {
+		t.Error("Should not be loading initially")
+	}
+	if m.inputMode != InputNone {
+		t.Error("Input mode should be InputNone initially")
+	}
+}
+
+func TestDiffModel_FileListNavigation(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+
+	// Simulate receiving changed files
+	m.changedFiles = []provider.IterationChange{
+		{ChangeID: 1, Path: "/src/main.go", ChangeType: "edit"},
+		{ChangeID: 2, Path: "/src/new.go", ChangeType: "add"},
+		{ChangeID: 3, Path: "/src/old.go", ChangeType: "delete"},
+	}
+	m.updateFileListViewport()
+
+	// Index 0 = General comments (virtual entry), 1-3 = files
+	if m.fileIndex != 0 {
+		t.Errorf("Initial fileIndex = %d, want 0", m.fileIndex)
+	}
+
+	// Navigate down through all items (general + 3 files = 4 total)
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if m.fileIndex != 1 {
+		t.Errorf("After j, fileIndex = %d, want 1", m.fileIndex)
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if m.fileIndex != 2 {
+		t.Errorf("After j, fileIndex = %d, want 2", m.fileIndex)
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if m.fileIndex != 3 {
+		t.Errorf("After j, fileIndex = %d, want 3", m.fileIndex)
+	}
+
+	// Navigate down at bottom (should stay)
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if m.fileIndex != 3 {
+		t.Errorf("After j at bottom, fileIndex = %d, want 3", m.fileIndex)
+	}
+
+	// Navigate up
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if m.fileIndex != 2 {
+		t.Errorf("After k, fileIndex = %d, want 2", m.fileIndex)
+	}
+}
+
+func TestDiffModel_FileListNavigation_UpDown(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+
+	m.changedFiles = []provider.IterationChange{
+		{ChangeID: 1, Path: "/a.go", ChangeType: "edit"},
+		{ChangeID: 2, Path: "/b.go", ChangeType: "edit"},
+	}
+	m.updateFileListViewport()
+
+	// Arrow down
+	m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if m.fileIndex != 1 {
+		t.Errorf("After down, fileIndex = %d, want 1", m.fileIndex)
+	}
+
+	// Arrow up
+	m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if m.fileIndex != 0 {
+		t.Errorf("After up, fileIndex = %d, want 0", m.fileIndex)
+	}
+
+	// Arrow up at top (should stay)
+	m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if m.fileIndex != 0 {
+		t.Errorf("After up at top, fileIndex = %d, want 0", m.fileIndex)
+	}
+}
+
+func TestDiffModel_BuildDiffLines(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+
+	m.currentDiff = &diff.FileDiff{
+		Path:       "/src/main.go",
+		ChangeType: "edit",
+		Hunks: []diff.Hunk{
+			{
+				OldStart: 1, OldCount: 3,
+				NewStart: 1, NewCount: 3,
+				Lines: []diff.Line{
+					{Type: diff.Context, Content: "line1", OldNum: 1, NewNum: 1},
+					{Type: diff.Removed, Content: "old", OldNum: 2, NewNum: 0},
+					{Type: diff.Added, Content: "new", OldNum: 0, NewNum: 2},
+					{Type: diff.Context, Content: "line3", OldNum: 3, NewNum: 3},
+				},
+			},
+		},
+	}
+	m.fileThreads = make(map[int][]provider.Thread)
+
+	m.buildDiffLines()
+
+	// Expect: hunk header + 4 diff lines = 5
+	if len(m.diffLines) != 5 {
+		t.Fatalf("Expected 5 diffLines, got %d", len(m.diffLines))
+	}
+
+	// First line should be hunk header
+	if m.diffLines[0].Type != diffLineHunkHeader {
+		t.Errorf("diffLines[0].Type = %d, want diffLineHunkHeader", m.diffLines[0].Type)
+	}
+
+	// Verify types
+	expectedTypes := []diffLineType{diffLineHunkHeader, diffLineContext, diffLineRemoved, diffLineAdded, diffLineContext}
+	for i, expected := range expectedTypes {
+		if m.diffLines[i].Type != expected {
+			t.Errorf("diffLines[%d].Type = %d, want %d", i, m.diffLines[i].Type, expected)
+		}
+	}
+}
+
+func TestDiffModel_BuildDiffLines_WithComments(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+
+	m.currentDiff = &diff.FileDiff{
+		Path:       "/src/main.go",
+		ChangeType: "edit",
+		Hunks: []diff.Hunk{
+			{
+				OldStart: 9, OldCount: 3,
+				NewStart: 9, NewCount: 3,
+				Lines: []diff.Line{
+					{Type: diff.Context, Content: "line9", OldNum: 9, NewNum: 9},
+					{Type: diff.Context, Content: "line10", OldNum: 10, NewNum: 10},
+					{Type: diff.Context, Content: "line11", OldNum: 11, NewNum: 11},
+				},
+			},
+		},
+	}
+	m.fileThreads = map[int][]provider.Thread{
+		10: {
+			{
+				Identity: provider.Identity{ID: "1"},
+				Status:   "active",
+				Comments: []provider.Comment{
+					{Identity: provider.Identity{ID: "1"}, Content: "Fix this", AuthorName: "Alice"},
+					{Identity: provider.Identity{ID: "2"}, Content: "Will do", AuthorName: "Bob", ParentCommentID: 1},
+				},
+			},
+		},
+	}
+
+	m.buildDiffLines()
+
+	// Expect: hunk header + line9 + line10 + 2 comments + line11 = 6
+	if len(m.diffLines) != 6 {
+		t.Fatalf("Expected 6 diffLines, got %d", len(m.diffLines))
+	}
+
+	// Lines at index 3 and 4 should be comments
+	if m.diffLines[3].Type != diffLineComment {
+		t.Errorf("diffLines[3].Type = %d, want diffLineComment", m.diffLines[3].Type)
+	}
+	if m.diffLines[3].ThreadID != 1 {
+		t.Errorf("diffLines[3].ThreadID = %d, want 1", m.diffLines[3].ThreadID)
+	}
+	if m.diffLines[4].Type != diffLineComment {
+		t.Errorf("diffLines[4].Type = %d, want diffLineComment", m.diffLines[4].Type)
+	}
+	if m.diffLines[4].CommentIdx != 1 {
+		t.Errorf("diffLines[4].CommentIdx = %d, want 1", m.diffLines[4].CommentIdx)
+	}
+}
+
+func TestDiffModel_BuildDiffLines_CommentTimestamps(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+
+	commentTime := time.Date(2026, 2, 24, 14, 30, 0, 0, time.UTC)
+	replyTime := time.Date(2026, 2, 24, 15, 45, 0, 0, time.UTC)
+
+	m.currentDiff = &diff.FileDiff{
+		Path:       "/src/main.go",
+		ChangeType: "edit",
+		Hunks: []diff.Hunk{
+			{
+				OldStart: 9, OldCount: 3,
+				NewStart: 9, NewCount: 3,
+				Lines: []diff.Line{
+					{Type: diff.Context, Content: "line9", OldNum: 9, NewNum: 9},
+					{Type: diff.Context, Content: "line10", OldNum: 10, NewNum: 10},
+					{Type: diff.Context, Content: "line11", OldNum: 11, NewNum: 11},
+				},
+			},
+		},
+	}
+	m.fileThreads = map[int][]provider.Thread{
+		10: {
+			{
+				Identity: provider.Identity{ID: "1"},
+				Status:   "active",
+				Comments: []provider.Comment{
+					{Identity: provider.Identity{ID: "1"}, Content: "Fix this", AuthorName: "Alice", PublishedDate: commentTime},
+					{Identity: provider.Identity{ID: "2"}, Content: "Will do", AuthorName: "Bob", ParentCommentID: 1, PublishedDate: replyTime},
+				},
+			},
+		},
+	}
+
+	m.buildDiffLines()
+
+	// Comment at index 3 should include Alice's timestamp
+	comment1 := m.diffLines[3]
+	if !strings.Contains(comment1.Content, "2026-02-24 14:30") {
+		t.Errorf("Comment content should contain timestamp, got: %s", comment1.Content)
+	}
+	if !strings.Contains(comment1.Content, "Alice") {
+		t.Errorf("Comment content should contain author, got: %s", comment1.Content)
+	}
+
+	// Reply at index 4 should include Bob's timestamp
+	comment2 := m.diffLines[4]
+	if !strings.Contains(comment2.Content, "2026-02-24 15:45") {
+		t.Errorf("Reply content should contain timestamp, got: %s", comment2.Content)
+	}
+	if !strings.Contains(comment2.Content, "Bob") {
+		t.Errorf("Reply content should contain author, got: %s", comment2.Content)
+	}
+}
+
+func TestDiffModel_BuildDiffLines_ThreadResolvedStatus(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+
+	commentTime := time.Date(2026, 2, 24, 14, 30, 0, 0, time.UTC)
+
+	m.currentDiff = &diff.FileDiff{
+		Path:       "/src/main.go",
+		ChangeType: "edit",
+		Hunks: []diff.Hunk{
+			{
+				OldStart: 9, OldCount: 3,
+				NewStart: 9, NewCount: 5,
+				Lines: []diff.Line{
+					{Type: diff.Context, Content: "line9", OldNum: 9, NewNum: 9},
+					{Type: diff.Context, Content: "line10", OldNum: 10, NewNum: 10},
+					{Type: diff.Context, Content: "line11", OldNum: 11, NewNum: 11},
+					{Type: diff.Context, Content: "line12", OldNum: 12, NewNum: 12},
+					{Type: diff.Context, Content: "line13", OldNum: 13, NewNum: 13},
+				},
+			},
+		},
+	}
+	m.fileThreads = map[int][]provider.Thread{
+		10: {
+			{
+				Identity: provider.Identity{ID: "1"},
+				Status:   "fixed",
+				Comments: []provider.Comment{
+					{Identity: provider.Identity{ID: "1"}, Content: "Fix this", AuthorName: "Alice", PublishedDate: commentTime},
+				},
+			},
+		},
+		12: {
+			{
+				Identity: provider.Identity{ID: "2"},
+				Status:   "active",
+				Comments: []provider.Comment{
+					{Identity: provider.Identity{ID: "3"}, Content: "Looks good", AuthorName: "Bob", PublishedDate: commentTime},
+				},
+			},
+		},
+	}
+
+	m.buildDiffLines()
+
+	// Find the resolved thread comment
+	var resolvedComment, activeComment *diffLine
+	for i := range m.diffLines {
+		if m.diffLines[i].Type == diffLineComment && m.diffLines[i].ThreadID == 1 {
+			resolvedComment = &m.diffLines[i]
+		}
+		if m.diffLines[i].Type == diffLineComment && m.diffLines[i].ThreadID == 2 {
+			activeComment = &m.diffLines[i]
+		}
+	}
+
+	if resolvedComment == nil {
+		t.Fatal("Expected to find resolved thread comment")
+	}
+	if activeComment == nil {
+		t.Fatal("Expected to find active thread comment")
+	}
+
+	// Resolved thread should carry the status
+	if resolvedComment.ThreadStatus != "fixed" {
+		t.Errorf("Resolved comment ThreadStatus = %q, want %q", resolvedComment.ThreadStatus, "fixed")
+	}
+
+	// Active thread should carry the status
+	if activeComment.ThreadStatus != "active" {
+		t.Errorf("Active comment ThreadStatus = %q, want %q", activeComment.ThreadStatus, "active")
+	}
+}
+
+func TestDiffModel_RenderResolvedComment(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+
+	commentTime := time.Date(2026, 2, 24, 14, 30, 0, 0, time.UTC)
+
+	// Build a resolved comment line
+	line := diffLine{
+		Type:         diffLineComment,
+		Content:      fmt.Sprintf("@[Alice] %s: Fix this", commentTime.Format("2006-01-02 15:04")),
+		ThreadID:     1,
+		CommentIdx:   0,
+		ThreadStatus: "fixed",
+	}
+
+	rendered := m.renderDiffLine(line, false)
+
+	// Resolved comment content should include a [Resolved] prefix
+	if !strings.Contains(rendered, "Resolved") {
+		t.Errorf("Resolved comment should contain 'Resolved' indicator, got: %s", rendered)
+	}
+
+	// Active comment should NOT include [Resolved] prefix
+	activeLine := diffLine{
+		Type:         diffLineComment,
+		Content:      line.Content,
+		ThreadID:     2,
+		CommentIdx:   0,
+		ThreadStatus: "active",
+	}
+	activeRendered := m.renderDiffLine(activeLine, false)
+	if strings.Contains(activeRendered, "Resolved") {
+		t.Errorf("Active comment should not contain 'Resolved' indicator, got: %s", activeRendered)
+	}
+
+	// Resolved prefix [Resolved] should be styled differently (contains ANSI escape codes from DiffCommentResolved style)
+	if rendered == activeRendered {
+		t.Error("Resolved comment should be rendered differently from active comment (styled [Resolved] prefix)")
+	}
+}
+
+func TestDiffModel_DiffViewNavigation(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.viewMode = DiffFileView
+
+	m.diffLines = []diffLine{
+		{Type: diffLineHunkHeader, Content: "@@ -1,3 +1,3 @@"},
+		{Type: diffLineContext, Content: "line1", OldNum: 1, NewNum: 1},
+		{Type: diffLineRemoved, Content: "old", OldNum: 2},
+		{Type: diffLineAdded, Content: "new", NewNum: 2},
+		{Type: diffLineContext, Content: "line3", OldNum: 3, NewNum: 3},
+	}
+	m.updateDiffViewport()
+
+	if m.selectedLine != 0 {
+		t.Errorf("Initial selectedLine = %d, want 0", m.selectedLine)
+	}
+
+	// Move down
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if m.selectedLine != 1 {
+		t.Errorf("After j, selectedLine = %d, want 1", m.selectedLine)
+	}
+
+	// Move up
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if m.selectedLine != 0 {
+		t.Errorf("After k, selectedLine = %d, want 0", m.selectedLine)
+	}
+}
+
+func TestDiffModel_FindNearestThread(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.viewMode = DiffFileView
+
+	m.diffLines = []diffLine{
+		{Type: diffLineContext, Content: "line1"},
+		{Type: diffLineContext, Content: "line2"},
+		{Type: diffLineComment, Content: "Alice: Fix this", ThreadID: 5},
+		{Type: diffLineContext, Content: "line3"},
+	}
+
+	// From line 3 (after comment), should find thread 5
+	m.selectedLine = 3
+	if got := m.findNearestThread(); got != 5 {
+		t.Errorf("findNearestThread() from line 3 = %d, want 5", got)
+	}
+
+	// From line 0 (before comment), should still find thread 5
+	m.selectedLine = 0
+	if got := m.findNearestThread(); got != 5 {
+		t.Errorf("findNearestThread() from line 0 = %d, want 5", got)
+	}
+}
+
+func TestDiffModel_FindNearestThread_NoThreads(t *testing.T) {
+	m := newTestDiffModel()
+	m.diffLines = []diffLine{
+		{Type: diffLineContext, Content: "line1"},
+	}
+	m.selectedLine = 0
+	if got := m.findNearestThread(); got != 0 {
+		t.Errorf("findNearestThread() with no threads = %d, want 0", got)
+	}
+}
+
+func TestDiffModel_JumpToNextComment(t *testing.T) {
+	m := newTestDiffModel()
+	m.diffLines = []diffLine{
+		{Type: diffLineContext, Content: "line1"},
+		{Type: diffLineComment, Content: "comment1", ThreadID: 1},
+		{Type: diffLineContext, Content: "line2"},
+		{Type: diffLineComment, Content: "comment2", ThreadID: 2},
+		{Type: diffLineContext, Content: "line3"},
+	}
+	m.selectedLine = 0
+
+	// Jump forward to first comment
+	m.jumpToNextComment(1)
+	if m.selectedLine != 1 {
+		t.Errorf("After jumpToNextComment(1), selectedLine = %d, want 1", m.selectedLine)
+	}
+
+	// Jump forward to second comment
+	m.jumpToNextComment(1)
+	if m.selectedLine != 3 {
+		t.Errorf("After jumpToNextComment(1), selectedLine = %d, want 3", m.selectedLine)
+	}
+
+	// Jump backward to first comment
+	m.jumpToNextComment(-1)
+	if m.selectedLine != 1 {
+		t.Errorf("After jumpToNextComment(-1), selectedLine = %d, want 1", m.selectedLine)
+	}
+}
+
+func TestDiffModel_GetContextItems_FileList(t *testing.T) {
+	m := newTestDiffModel()
+	m.viewMode = DiffFileList
+
+	items := m.GetContextItems()
+	if len(items) == 0 {
+		t.Error("Expected context items for file list mode")
+	}
+
+	// Should have page
+	hasPage := false
+	for _, item := range items {
+		if item.Description == "page" {
+			hasPage = true
+		}
+	}
+	if !hasPage {
+		t.Error("Missing 'page' context item")
+	}
+}
+
+func TestDiffModel_GetContextItems_DiffView(t *testing.T) {
+	m := newTestDiffModel()
+	m.viewMode = DiffFileView
+
+	items := m.GetContextItems()
+	if len(items) == 0 {
+		t.Error("Expected context items for diff view mode")
+	}
+
+	// Should have comment, reply, resolve
+	hasComment := false
+	hasReply := false
+	hasResolve := false
+	for _, item := range items {
+		if item.Description == "comment" {
+			hasComment = true
+		}
+		if item.Description == "reply" {
+			hasReply = true
+		}
+		if item.Description == "resolve" {
+			hasResolve = true
+		}
+	}
+	if !hasComment {
+		t.Error("Missing 'comment' context item")
+	}
+	if !hasReply {
+		t.Error("Missing 'reply' context item")
+	}
+	if !hasResolve {
+		t.Error("Missing 'resolve' context item")
+	}
+}
+
+func TestDiffModel_GetContextItems_InputMode(t *testing.T) {
+	m := newTestDiffModel()
+	m.inputMode = InputNewComment
+
+	items := m.GetContextItems()
+	if len(items) != 2 {
+		t.Fatalf("Expected 2 context items in input mode, got %d", len(items))
+	}
+}
+
+func TestDiffModel_EscFromFileList(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.viewMode = DiffFileList
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd == nil {
+		t.Fatal("Expected esc to produce a command")
+	}
+
+	// Execute the command to get the message
+	msg := cmd()
+	if _, ok := msg.(exitDiffViewMsg); !ok {
+		t.Errorf("Expected exitDiffViewMsg, got %T", msg)
+	}
+}
+
+func TestDiffModel_EscFromDiffView(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.viewMode = DiffFileView
+	change := provider.IterationChange{Path: "/test.go"}
+	m.currentFile = &change
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd == nil {
+		t.Fatal("Expected esc from diff view to produce a command")
+	}
+
+	// Should emit exitDiffViewMsg (back to detail view)
+	msg := cmd()
+	if _, ok := msg.(exitDiffViewMsg); !ok {
+		t.Errorf("Expected exitDiffViewMsg, got %T", msg)
+	}
+}
+
+func TestDiffModel_View_Loading(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.loading = true
+	m.spinner.SetVisible(true)
+	m.spinner.SetMessage("Loading changed files...")
+
+	view := m.View()
+
+	if !strings.Contains(view, "Loading changed files") {
+		t.Errorf("Loading view should contain spinner message, got:\n%s", view)
+	}
+}
+
+func TestDiffModel_View_Error(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.err = fmt.Errorf("connection timed out")
+
+	view := m.View()
+
+	if !strings.Contains(view, "connection timed out") {
+		t.Errorf("Error view should contain the error message, got:\n%s", view)
+	}
+	if !strings.Contains(view, "Esc") {
+		t.Error("Error view should contain Esc hint for going back")
+	}
+}
+
+func TestDiffModel_View_EmptyFileList(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.changedFiles = nil
+	m.updateFileListViewport()
+
+	view := m.View()
+
+	if !strings.Contains(view, "No changed files") {
+		t.Errorf("Empty file list view should contain 'No changed files', got:\n%s", view)
+	}
+	if !strings.Contains(view, "Changed files (0)") {
+		t.Errorf("Empty file list view should show 'Changed files (0)' header, got:\n%s", view)
+	}
+}
+
+func TestDiffModel_ChangedFilesMsg(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.loading = true
+
+	changes := []provider.IterationChange{
+		{ChangeID: 1, Path: "/a.go", ChangeType: "edit"},
+		{ChangeID: 2, Path: "/b.go", ChangeType: "add"},
+	}
+
+	m.Update(changedFilesMsg{changes: changes})
+
+	if m.loading {
+		t.Error("Should not be loading after changedFilesMsg")
+	}
+	if len(m.changedFiles) != 2 {
+		t.Errorf("Expected 2 changed files, got %d", len(m.changedFiles))
+	}
+	if m.fileIndex != 0 {
+		t.Errorf("fileIndex = %d, want 0", m.fileIndex)
+	}
+}
+
+func TestDiffModel_ChangedFilesMsg_Error(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.loading = true
+
+	m.Update(changedFilesMsg{err: fmt.Errorf("API error")})
+
+	if m.loading {
+		t.Error("Should not be loading after error")
+	}
+	if m.err == nil {
+		t.Error("Expected error to be set")
+	}
+}
+
+func TestDiffModel_FileListScrollsToKeepSelectionVisible(t *testing.T) {
+	m := newTestDiffModel()
+	// Small viewport: only 5 lines visible
+	m.SetSize(80, 6) // 6 - 1 header = 5 viewport lines
+
+	// Create 10 files, more than fit in the viewport
+	files := make([]provider.IterationChange, 10)
+	for i := range files {
+		files[i] = provider.IterationChange{
+			ChangeID:   i + 1,
+			Path:       fmt.Sprintf("/src/file%d.go", i),
+			ChangeType: "edit",
+		}
+	}
+	m.changedFiles = files
+	m.fileIndex = 0
+	m.updateFileListViewport()
+
+	// Navigate down past the viewport boundary
+	for i := 0; i < 7; i++ {
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	}
+
+	if m.fileIndex != 7 {
+		t.Fatalf("fileIndex = %d, want 7", m.fileIndex)
+	}
+
+	// The viewport should have scrolled so that fileIndex 7 is visible
+	yOffset := m.viewport.YOffset
+	viewBottom := yOffset + m.viewport.Height - 1
+	if m.fileIndex < yOffset || m.fileIndex > viewBottom {
+		t.Errorf("fileIndex %d not visible in viewport (yOffset=%d, height=%d, viewBottom=%d)",
+			m.fileIndex, yOffset, m.viewport.Height, viewBottom)
+	}
+}
+
+func TestDiffModel_FileListScrollsBackUp(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 6) // 5 viewport lines
+
+	files := make([]provider.IterationChange, 10)
+	for i := range files {
+		files[i] = provider.IterationChange{
+			ChangeID:   i + 1,
+			Path:       fmt.Sprintf("/src/file%d.go", i),
+			ChangeType: "edit",
+		}
+	}
+	m.changedFiles = files
+	m.fileIndex = 0
+	m.updateFileListViewport()
+
+	// Navigate to bottom
+	for i := 0; i < 9; i++ {
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	}
+	// Navigate back to top
+	for i := 0; i < 9; i++ {
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	}
+
+	if m.fileIndex != 0 {
+		t.Fatalf("fileIndex = %d, want 0", m.fileIndex)
+	}
+
+	// Viewport should have scrolled back so file 0 is visible
+	if m.viewport.YOffset > 0 {
+		t.Errorf("viewport.YOffset = %d, want 0 (should scroll back to top)", m.viewport.YOffset)
+	}
+}
+
+func TestDiffModel_FiltersFolderEntries(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.loading = true
+
+	// Simulate API response with folder/tree entries mixed in
+	changes := []provider.IterationChange{
+		{ChangeID: 1, Path: "/", GitObjectType: "tree", ChangeType: "edit"},
+		{ChangeID: 2, Path: "/src/main.go", GitObjectType: "blob", ChangeType: "edit"},
+		{ChangeID: 3, Path: "/src", GitObjectType: "tree", ChangeType: "edit"},
+		{ChangeID: 4, Path: "/src/utils.go", GitObjectType: "blob", ChangeType: "add"},
+	}
+
+	m.Update(changedFilesMsg{changes: changes})
+
+	// Should only have the blob entries (actual files)
+	if len(m.changedFiles) != 2 {
+		t.Errorf("Expected 2 file entries after filtering, got %d", len(m.changedFiles))
+		for i, f := range m.changedFiles {
+			t.Logf("  [%d] path=%q type=%q", i, f.Path, f.GitObjectType)
+		}
+	}
+}
+
+func TestFilterFileChanges(t *testing.T) {
+	changes := []provider.IterationChange{
+		{ChangeID: 1, Path: "/", GitObjectType: "tree"},
+		{ChangeID: 2, Path: "/src/main.go", GitObjectType: "blob", ChangeType: "edit"},
+		{ChangeID: 3, Path: "/src", GitObjectType: "tree"},
+		{ChangeID: 4, Path: "/src/utils.go", ChangeType: "add"},
+		{ChangeID: 5, Path: ""},
+	}
+
+	filtered := filterFileChanges(changes)
+
+	if len(filtered) != 2 {
+		t.Fatalf("Expected 2 entries, got %d", len(filtered))
+	}
+	if filtered[0].Path != "/src/main.go" {
+		t.Errorf("filtered[0].Path = %q, want /src/main.go", filtered[0].Path)
+	}
+	if filtered[1].Path != "/src/utils.go" {
+		t.Errorf("filtered[1].Path = %q, want /src/utils.go", filtered[1].Path)
+	}
+}
+
+func TestDiffModel_FileListPageDown(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 6) // 5 viewport lines
+
+	files := make([]provider.IterationChange, 20)
+	for i := range files {
+		files[i] = provider.IterationChange{
+			ChangeID:   i + 1,
+			Path:       fmt.Sprintf("/src/file%d.go", i),
+			ChangeType: "edit",
+		}
+	}
+	m.changedFiles = files
+	m.fileIndex = 0
+	m.updateFileListViewport()
+
+	// Page down should jump by viewport height
+	m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	if m.fileIndex != m.viewport.Height {
+		t.Errorf("After pgdown, fileIndex = %d, want %d", m.fileIndex, m.viewport.Height)
+	}
+
+	// Should be visible
+	yOffset := m.viewport.YOffset
+	viewBottom := yOffset + m.viewport.Height - 1
+	if m.fileIndex < yOffset || m.fileIndex > viewBottom {
+		t.Errorf("fileIndex %d not visible after pgdown (yOffset=%d, viewBottom=%d)",
+			m.fileIndex, yOffset, viewBottom)
+	}
+}
+
+func TestDiffModel_FileListPageUp(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 6) // 5 viewport lines
+
+	files := make([]provider.IterationChange, 20)
+	for i := range files {
+		files[i] = provider.IterationChange{
+			ChangeID:   i + 1,
+			Path:       fmt.Sprintf("/src/file%d.go", i),
+			ChangeType: "edit",
+		}
+	}
+	m.changedFiles = files
+	m.fileIndex = 15
+	m.updateFileListViewport()
+
+	// Page up should jump back by viewport height
+	m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	expected := 15 - m.viewport.Height
+	if m.fileIndex != expected {
+		t.Errorf("After pgup from 15, fileIndex = %d, want %d", m.fileIndex, expected)
+	}
+}
+
+func TestDiffModel_FileListPageDown_ClampsAtEnd(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 6)
+
+	files := make([]provider.IterationChange, 8)
+	for i := range files {
+		files[i] = provider.IterationChange{
+			ChangeID:   i + 1,
+			Path:       fmt.Sprintf("/src/file%d.go", i),
+			ChangeType: "edit",
+		}
+	}
+	m.changedFiles = files
+	// Total items = 1 (general) + 8 files = 9, max index = 8
+	m.fileIndex = 7
+	m.updateFileListViewport()
+
+	// Page down near the end should clamp to last item
+	m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	if m.fileIndex != 8 {
+		t.Errorf("After pgdown near end, fileIndex = %d, want 8", m.fileIndex)
+	}
+}
+
+func TestDiffModel_FileListPageUp_ClampsAtStart(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 6)
+
+	files := make([]provider.IterationChange, 10)
+	for i := range files {
+		files[i] = provider.IterationChange{
+			ChangeID:   i + 1,
+			Path:       fmt.Sprintf("/src/file%d.go", i),
+			ChangeType: "edit",
+		}
+	}
+	m.changedFiles = files
+	m.fileIndex = 2
+	m.updateFileListViewport()
+
+	// Page up near the top should clamp to 0
+	m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	if m.fileIndex != 0 {
+		t.Errorf("After pgup near start, fileIndex = %d, want 0", m.fileIndex)
+	}
+}
+
+func TestDiffModel_FileListScrollPercent(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 6) // 5 viewport lines
+
+	files := make([]provider.IterationChange, 20)
+	for i := range files {
+		files[i] = provider.IterationChange{
+			ChangeID:   i + 1,
+			Path:       fmt.Sprintf("/src/file%d.go", i),
+			ChangeType: "edit",
+		}
+	}
+	m.changedFiles = files
+	m.fileIndex = 0
+	m.updateFileListViewport()
+
+	// At top, scroll percent should be 0
+	pct := m.GetScrollPercent()
+	if pct != 0 {
+		t.Errorf("At top, scroll percent = %f, want 0", pct)
+	}
+
+	// Navigate to bottom (1 general + 20 files = 21 items, max index 20)
+	for i := 0; i < 20; i++ {
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	}
+
+	// At bottom, scroll percent should be 100
+	pct = m.GetScrollPercent()
+	if pct != 100 {
+		t.Errorf("At bottom, scroll percent = %f, want 100", pct)
+	}
+}
+
+func TestDiffModel_FiltersEmptyPathEntries(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.loading = true
+
+	changes := []provider.IterationChange{
+		{ChangeID: 1, Path: "", ChangeType: "edit"},
+		{ChangeID: 2, Path: "/src/main.go", ChangeType: "edit"},
+	}
+
+	m.Update(changedFilesMsg{changes: changes})
+
+	if len(m.changedFiles) != 1 {
+		t.Errorf("Expected 1 file entry after filtering empty paths, got %d", len(m.changedFiles))
+	}
+	if len(m.changedFiles) > 0 && m.changedFiles[0].Path != "/src/main.go" {
+		t.Errorf("Expected /src/main.go, got %q", m.changedFiles[0].Path)
+	}
+}
+
+func TestDiffModel_ChangedFilesMsgDoesNotOverwriteDiffViewport(t *testing.T) {
+	// Regression: when InitWithFile fires both fetchChangedFiles and fetchFileDiff
+	// concurrently, if fileDiffMsg arrives first the viewport shows the diff.
+	// Then changedFilesMsg must NOT overwrite the viewport with file list content.
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+
+	// 1. Simulate fileDiffMsg arriving first
+	testDiff := &diff.FileDiff{
+		Path:       "/src/main.go",
+		ChangeType: "edit",
+		Hunks: []diff.Hunk{
+			{
+				OldStart: 1, OldCount: 2,
+				NewStart: 1, NewCount: 2,
+				Lines: []diff.Line{
+					{Type: diff.Context, Content: "line1", OldNum: 1, NewNum: 1},
+					{Type: diff.Added, Content: "new line", OldNum: 0, NewNum: 2},
+				},
+			},
+		},
+	}
+	m.Update(fileDiffMsg{diff: testDiff, fileThreads: make(map[int][]provider.Thread)})
+
+	if m.viewMode != DiffFileView {
+		t.Fatalf("viewMode = %d after fileDiffMsg, want DiffFileView", m.viewMode)
+	}
+
+	// Capture the viewport content after diff was set
+	diffContent := m.viewport.View()
+
+	// 2. Simulate changedFilesMsg arriving second (the late response)
+	changes := []provider.IterationChange{
+		{ChangeID: 1, Path: "/src/main.go", ChangeType: "edit"},
+		{ChangeID: 2, Path: "/src/other.go", ChangeType: "add"},
+	}
+	m.Update(changedFilesMsg{changes: changes})
+
+	// viewMode should still be DiffFileView
+	if m.viewMode != DiffFileView {
+		t.Errorf("viewMode = %d after changedFilesMsg, want DiffFileView", m.viewMode)
+	}
+
+	// Viewport content should NOT have changed (still showing diff, not file list)
+	afterContent := m.viewport.View()
+	if afterContent != diffContent {
+		t.Errorf("changedFilesMsg overwrote diff viewport content;\nbefore: %q\nafter:  %q", diffContent, afterContent)
+	}
+
+	// Changed files data should still be stored
+	if len(m.changedFiles) != 2 {
+		t.Errorf("changedFiles length = %d, want 2", len(m.changedFiles))
+	}
+}
+
+func TestDiffModel_VisualLineForDiffLine(t *testing.T) {
+	m := newTestDiffModel()
+	m.diffLines = []diffLine{
+		{Type: diffLineHunkHeader, Content: "@@ -1,3 +1,3 @@"},
+		{Type: diffLineContext, Content: "line1", OldNum: 1, NewNum: 1},
+		{Type: diffLineComment, Content: "Alice: first\nsecond\nthird", ThreadID: 1, CommentIdx: 0},
+		{Type: diffLineContext, Content: "line2", OldNum: 2, NewNum: 2},
+	}
+
+	// Index 0: visual line 0
+	if got := m.visualLineForDiffLine(0); got != 0 {
+		t.Errorf("visualLineForDiffLine(0) = %d, want 0", got)
+	}
+	// Index 1: visual line 1 (hunk header is 1 visual line)
+	if got := m.visualLineForDiffLine(1); got != 1 {
+		t.Errorf("visualLineForDiffLine(1) = %d, want 1", got)
+	}
+	// Index 2: visual line 2 (context line is 1 visual line)
+	if got := m.visualLineForDiffLine(2); got != 2 {
+		t.Errorf("visualLineForDiffLine(2) = %d, want 2", got)
+	}
+	// Index 3: visual line 5 (comment has 3 visual lines: 1 base + 2 newlines)
+	if got := m.visualLineForDiffLine(3); got != 5 {
+		t.Errorf("visualLineForDiffLine(3) = %d, want 5", got)
+	}
+}
+
+func TestDiffModel_IsInputActive(t *testing.T) {
+	tests := []struct {
+		name      string
+		inputMode InputMode
+		want      bool
+	}{
+		{"InputNone returns false", InputNone, false},
+		{"InputNewComment returns true", InputNewComment, true},
+		{"InputReply returns true", InputReply, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newTestDiffModel()
+			m.inputMode = tt.inputMode
+
+			got := m.IsInputActive()
+			if got != tt.want {
+				t.Errorf("IsInputActive() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDiffModel_InputMode_BlocksKeystrokes(t *testing.T) {
+	// When inputMode is active, typing 'h' or '?' should go to the text input,
+	// not trigger global shortcuts. This tests that the diff view routes
+	// keystrokes to updateInput when inputMode != InputNone.
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.viewMode = DiffFileView
+	m.inputMode = InputNewComment
+	m.textInput.Focus()
+
+	// Type 'h' — should be captured by text input, not leaked to global shortcuts
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
+	if m.textInput.Value() != "h" {
+		t.Errorf("After typing 'h' in input mode, textInput.Value() = %q, want %q", m.textInput.Value(), "h")
+	}
+
+	// Type '?' — should also be captured
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
+	if m.textInput.Value() != "h?" {
+		t.Errorf("After typing '?', textInput.Value() = %q, want %q", m.textInput.Value(), "h?")
+	}
+
+	// Type 't' — should also be captured
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	if m.textInput.Value() != "h?t" {
+		t.Errorf("After typing 't', textInput.Value() = %q, want %q", m.textInput.Value(), "h?t")
+	}
+}
+
+// --- Refresh key tests ---
+
+func TestDiffModel_RefreshKey_FileList(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.viewMode = DiffFileList
+	m.err = fmt.Errorf("previous error")
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+
+	if !m.loading {
+		t.Error("After 'r', model should be in loading state")
+	}
+	if m.err != nil {
+		t.Error("After 'r', previous error should be cleared")
+	}
+	if cmd == nil {
+		t.Error("After 'r', expected a command to fetch changed files")
+	}
+}
+
+// --- Reply and resolve key tests ---
+
+func TestDiffModel_ReplyKey_SetsInputMode(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.viewMode = DiffFileView
+	m.diffLines = []diffLine{
+		{Type: diffLineContext, Content: "line1", OldNum: 1, NewNum: 1},
+		{Type: diffLineComment, Content: "Alice: Fix this", ThreadID: 5, CommentIdx: 0},
+		{Type: diffLineContext, Content: "line2", OldNum: 2, NewNum: 2},
+	}
+	m.selectedLine = 2 // on line after the comment
+
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+
+	if m.inputMode != InputReply {
+		t.Errorf("After 'p', inputMode = %d, want InputReply", m.inputMode)
+	}
+	if m.replyThreadID != 5 {
+		t.Errorf("After 'p', replyThreadID = %d, want 5", m.replyThreadID)
+	}
+	if m.textInput.Value() != "" {
+		t.Error("Text input should be empty after opening reply")
+	}
+}
+
+func TestDiffModel_ReplyKey_NoopWithoutThread(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.viewMode = DiffFileView
+	m.diffLines = []diffLine{
+		{Type: diffLineContext, Content: "line1", OldNum: 1, NewNum: 1},
+		{Type: diffLineContext, Content: "line2", OldNum: 2, NewNum: 2},
+	}
+	m.selectedLine = 0
+
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+
+	if m.inputMode != InputNone {
+		t.Errorf("After 'p' with no thread, inputMode = %d, want InputNone", m.inputMode)
+	}
+}
+
+func TestDiffModel_ResolveKey_ReturnsCommand(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.viewMode = DiffFileView
+	m.diffLines = []diffLine{
+		{Type: diffLineComment, Content: "Alice: Fix this", ThreadID: 7, CommentIdx: 0, ThreadStatus: "active"},
+		{Type: diffLineContext, Content: "line1", OldNum: 1, NewNum: 1},
+	}
+	m.selectedLine = 1 // on line after the comment
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+
+	if cmd == nil {
+		t.Fatal("After 'x' near a thread, expected a resolve command")
+	}
+}
+
+func TestDiffModel_ResolveKey_NoopWithoutThread(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 24)
+	m.viewMode = DiffFileView
+	m.diffLines = []diffLine{
+		{Type: diffLineContext, Content: "line1", OldNum: 1, NewNum: 1},
+	}
+	m.selectedLine = 0
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+
+	if cmd != nil {
+		t.Error("After 'x' with no thread, expected nil command")
+	}
+}
+
+// --- General comments tests ---
+
+func newTestDiffModelWithGeneralComments() *DiffModel {
+	pr := provider.PullRequest{
+		Identity:       provider.Identity{Kind: provider.KindAzure, Scope: "proj", ID: "101"},
+		Title:          "Test PR",
+		SourceRefName:  "refs/heads/feature/test",
+		TargetRefName:  "refs/heads/main",
+		RepositoryID:   "repo-123",
+		RepositoryName: "test-repo",
+	}
+	threads := []provider.Thread{
+		{
+			Identity: provider.Identity{ID: "1"},
+			Status:   "active",
+			FilePath: "/src/main.go",
+			Line:     10,
+			Comments: []provider.Comment{
+				{Identity: provider.Identity{ID: "1"}, Content: "Fix this", AuthorName: "Alice"},
+			},
+		},
+		{
+			Identity: provider.Identity{ID: "2"},
+			Status:   "active",
+			FilePath: "", // general comment
+			Comments: []provider.Comment{
+				{Identity: provider.Identity{ID: "2"}, Content: "Looks good overall", AuthorName: "Bob"},
+				{Identity: provider.Identity{ID: "3"}, Content: "Thanks!", AuthorName: "Alice", ParentCommentID: 2},
+			},
+		},
+		{
+			Identity: provider.Identity{ID: "3"},
+			Status:   "fixed",
+			FilePath: "", // resolved general comment
+			Comments: []provider.Comment{
+				{Identity: provider.Identity{ID: "4"}, Content: "Add docs?", AuthorName: "Charlie"},
+			},
+		},
+	}
+	s := styles.DefaultStyles()
+	return NewDiffModel(nil, pr, threads, s)
+}
+
+func TestDiffModel_GeneralThreadsComputed(t *testing.T) {
+	m := newTestDiffModelWithGeneralComments()
+
+	if len(m.generalThreads) != 2 {
+		t.Errorf("Expected 2 general threads, got %d", len(m.generalThreads))
+	}
+	if parseThreadID(m.generalThreads[0].Identity.ID) != 2 {
+		t.Errorf("First general thread ID = %q, want '2'", m.generalThreads[0].Identity.ID)
+	}
+	if parseThreadID(m.generalThreads[1].Identity.ID) != 3 {
+		t.Errorf("Second general thread ID = %q, want '3'", m.generalThreads[1].Identity.ID)
+	}
+}
+
+func TestDiffModel_FileListAlwaysShowsGeneralComments(t *testing.T) {
+	// Even with no general comments, the entry should appear
+	m := newTestDiffModel() // has no general comments
+	m.SetSize(80, 24)
+	m.changedFiles = []provider.IterationChange{
+		{ChangeID: 1, Path: "/src/main.go", ChangeType: "edit"},
+	}
+	m.updateFileListViewport()
+
+	view := m.viewFileList()
+	if !strings.Contains(view, "General comments") {
+		t.Error("File list should always contain 'General comments' entry")
+	}
+}
+
+func TestDiffModel_FileListShowsGeneralCommentCount(t *testing.T) {
+	m := newTestDiffModelWithGeneralComments()
+	m.SetSize(80, 24)
+	m.changedFiles = []provider.IterationChange{
+		{ChangeID: 1, Path: "/src/main.go", ChangeType: "edit"},
+	}
+	m.updateFileListViewport()
+
+	view := m.viewFileList()
+	// Should show count of general comment threads
+	if !strings.Contains(view, "General comments (2)") {
+		t.Errorf("File list should show 'General comments (2)', got:\n%s", view)
+	}
+}
+
+func TestDiffModel_FileListIndexOffset(t *testing.T) {
+	m := newTestDiffModelWithGeneralComments()
+	m.SetSize(80, 24)
+	m.changedFiles = []provider.IterationChange{
+		{ChangeID: 1, Path: "/a.go", ChangeType: "edit"},
+		{ChangeID: 2, Path: "/b.go", ChangeType: "edit"},
+	}
+	m.updateFileListViewport()
+
+	// Index 0 should be general comments
+	if m.fileIndex != 0 {
+		t.Errorf("Initial fileIndex = %d, want 0", m.fileIndex)
+	}
+	if !m.isGeneralCommentsSelected() {
+		t.Error("Index 0 should be general comments")
+	}
+
+	// Navigate down to first file
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if m.fileIndex != 1 {
+		t.Errorf("After j, fileIndex = %d, want 1", m.fileIndex)
+	}
+	if m.isGeneralCommentsSelected() {
+		t.Error("Index 1 should NOT be general comments")
+	}
+
+	// Navigate down to second file
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if m.fileIndex != 2 {
+		t.Errorf("After j, fileIndex = %d, want 2", m.fileIndex)
+	}
+
+	// Can't go further
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if m.fileIndex != 2 {
+		t.Errorf("After j at bottom, fileIndex = %d, want 2", m.fileIndex)
+	}
+}
+
+func TestDiffModel_EnterGeneralComments(t *testing.T) {
+	m := newTestDiffModelWithGeneralComments()
+	m.SetSize(80, 24)
+	m.changedFiles = []provider.IterationChange{
+		{ChangeID: 1, Path: "/a.go", ChangeType: "edit"},
+	}
+	m.updateFileListViewport()
+
+	// At index 0 (general comments), press enter
+	m.fileIndex = 0
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.viewMode != DiffFileView {
+		t.Errorf("viewMode = %d, want DiffFileView", m.viewMode)
+	}
+	if !m.viewingGeneralComments {
+		t.Error("Should be viewing general comments")
+	}
+}
+
+func TestDiffModel_BuildGeneralCommentLines(t *testing.T) {
+	m := newTestDiffModelWithGeneralComments()
+	m.SetSize(80, 24)
+	m.viewingGeneralComments = true
+
+	m.buildGeneralCommentLines()
+
+	if len(m.diffLines) == 0 {
+		t.Fatal("Expected diffLines to be populated with general comments")
+	}
+
+	// Should have comment lines for all comments across general threads
+	commentCount := 0
+	for _, line := range m.diffLines {
+		if line.Type == diffLineComment {
+			commentCount++
+		}
+	}
+
+	// Thread 2 has 2 comments, thread 3 has 1 comment = 3 total
+	if commentCount != 3 {
+		t.Errorf("Expected 3 comment lines, got %d", commentCount)
+	}
+
+	// First comment should be from thread 2
+	firstComment := findFirstComment(m.diffLines)
+	if firstComment == nil {
+		t.Fatal("No comment lines found")
+	}
+	if firstComment.ThreadID != 2 {
+		t.Errorf("First comment ThreadID = %d, want 2", firstComment.ThreadID)
+	}
+}
+
+func TestDiffModel_GeneralCommentsViewHeader(t *testing.T) {
+	m := newTestDiffModelWithGeneralComments()
+	m.SetSize(80, 24)
+	m.viewingGeneralComments = true
+	m.viewMode = DiffFileView
+
+	m.buildGeneralCommentLines()
+	m.updateDiffViewport()
+
+	view := m.viewFileDiff()
+	if !strings.Contains(view, "General comments") {
+		t.Errorf("General comments view should show header, got:\n%s", view)
+	}
+}
+
+func TestDiffModel_EscFromGeneralComments(t *testing.T) {
+	m := newTestDiffModelWithGeneralComments()
+	m.SetSize(80, 24)
+	m.viewMode = DiffFileView
+	m.viewingGeneralComments = true
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	if m.viewingGeneralComments {
+		t.Error("After esc, viewingGeneralComments should be false")
+	}
+	// Should emit exitDiffViewMsg to go back to detail view
+	if cmd == nil {
+		t.Fatal("Expected esc to produce a command")
+	}
+	msg := cmd()
+	if _, ok := msg.(exitDiffViewMsg); !ok {
+		t.Errorf("Expected exitDiffViewMsg, got %T", msg)
+	}
+}
+
+func TestDiffModel_GeneralComments_NewCommentKey(t *testing.T) {
+	m := newTestDiffModelWithGeneralComments()
+	m.SetSize(80, 24)
+	m.viewMode = DiffFileView
+	m.viewingGeneralComments = true
+	m.diffLines = []diffLine{
+		{Type: diffLineComment, Content: "test", ThreadID: 2},
+	}
+	m.selectedLine = 0
+
+	// Press 'c' to create new general comment
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+
+	if m.inputMode != InputNewComment {
+		t.Errorf("After 'c' in general comments, inputMode = %d, want InputNewComment", m.inputMode)
+	}
+}
+
+func TestDiffModel_GeneralComments_ContextItems(t *testing.T) {
+	m := newTestDiffModelWithGeneralComments()
+	m.viewMode = DiffFileView
+	m.viewingGeneralComments = true
+
+	items := m.GetContextItems()
+
+	hasComment := false
+	hasReply := false
+	hasResolve := false
+	for _, item := range items {
+		if item.Description == "comment" {
+			hasComment = true
+		}
+		if item.Description == "reply" {
+			hasReply = true
+		}
+		if item.Description == "resolve" {
+			hasResolve = true
+		}
+	}
+
+	if !hasComment {
+		t.Error("Missing 'comment' context item for general comments view")
+	}
+	if !hasReply {
+		t.Error("Missing 'reply' context item for general comments view")
+	}
+	if !hasResolve {
+		t.Error("Missing 'resolve' context item for general comments view")
+	}
+}
+
+func TestDiffModel_ThreadsRefresh_UpdatesGeneralThreads(t *testing.T) {
+	m := newTestDiffModelWithGeneralComments()
+	m.SetSize(80, 24)
+
+	// Initially has 2 general threads
+	if len(m.generalThreads) != 2 {
+		t.Fatalf("Expected 2 general threads initially, got %d", len(m.generalThreads))
+	}
+
+	// Simulate threads refresh with an additional general thread
+	newThreads := append(m.threads, provider.Thread{
+		Identity: provider.Identity{ID: "10"},
+		Status:   "active",
+		FilePath: "",
+		Comments: []provider.Comment{{Identity: provider.Identity{ID: "10"}, Content: "New general comment"}},
+	})
+
+	m.Update(threadsRefreshMsg{threads: newThreads})
+
+	if len(m.generalThreads) != 3 {
+		t.Errorf("After refresh, expected 3 general threads, got %d", len(m.generalThreads))
+	}
+}
+
+// helper to find the first comment diffLine
+func findFirstComment(lines []diffLine) *diffLine {
+	for i := range lines {
+		if lines[i].Type == diffLineComment {
+			return &lines[i]
+		}
+	}
+	return nil
+}
+
+func TestDiffModel_ScrollPastMultiLineComments(t *testing.T) {
+	m := newTestDiffModel()
+	m.SetSize(80, 6) // 5 viewport lines
+	m.viewMode = DiffFileView
+
+	// Build diffLines with a multi-line comment in the middle
+	m.diffLines = make([]diffLine, 0)
+	for i := 1; i <= 5; i++ {
+		m.diffLines = append(m.diffLines, diffLine{
+			Type: diffLineContext, Content: fmt.Sprintf("line%d", i), OldNum: i, NewNum: i,
+		})
+	}
+	// Insert a 5-line comment after line 5
+	m.diffLines = append(m.diffLines, diffLine{
+		Type: diffLineComment, Content: "Alice: L1\nL2\nL3\nL4\nL5", ThreadID: 1, CommentIdx: 0,
+	})
+	for i := 6; i <= 15; i++ {
+		m.diffLines = append(m.diffLines, diffLine{
+			Type: diffLineContext, Content: fmt.Sprintf("line%d", i), OldNum: i, NewNum: i,
+		})
+	}
+	m.updateDiffViewport()
+
+	// Scroll all the way to the bottom
+	for i := 0; i < len(m.diffLines)-1; i++ {
+		m.selectedLine = i + 1
+		m.updateDiffViewport()
+		m.ensureDiffLineVisible()
+	}
+
+	// Should be able to reach 100% scroll
+	pct := m.GetScrollPercent()
+	if pct < 99 {
+		t.Errorf("After scrolling to bottom, scroll percent = %.0f%%, want ~100%%", pct)
+	}
+}

@@ -1,0 +1,1252 @@
+package azdevops
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestWorkItem_StateIcon(t *testing.T) {
+	tests := []struct {
+		state string
+		want  string
+	}{
+		{"New", "○"},
+		{"new", "○"},
+		{"Active", "◐"},
+		{"active", "◐"},
+		{"Resolved", "●"},
+		{"resolved", "●"},
+		{"Ready for Test", "●"},
+		{"Ready For Test", "●"},
+		{"ready for test", "●"},
+		{"Closed", "✓"},
+		{"closed", "✓"},
+		{"Removed", "✗"},
+		{"removed", "✗"},
+		{"Unknown", "○"},
+		{"", "○"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.state, func(t *testing.T) {
+			wi := WorkItem{Fields: WorkItemFields{State: tt.state}}
+			got := wi.StateIcon()
+			if got != tt.want {
+				t.Errorf("StateIcon() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWorkItem_AssignedToName(t *testing.T) {
+	tests := []struct {
+		name       string
+		assignedTo *Identity
+		want       string
+	}{
+		{
+			name:       "nil assignedTo",
+			assignedTo: nil,
+			want:       "-",
+		},
+		{
+			name:       "with assignedTo",
+			assignedTo: &Identity{DisplayName: "John Doe"},
+			want:       "John Doe",
+		},
+		{
+			name:       "empty displayName",
+			assignedTo: &Identity{DisplayName: ""},
+			want:       "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wi := WorkItem{Fields: WorkItemFields{AssignedTo: tt.assignedTo}}
+			got := wi.AssignedToName()
+			if got != tt.want {
+				t.Errorf("AssignedToName() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWorkItemFields_ReproStepsDeserialization(t *testing.T) {
+	// Bug work items in Azure DevOps use Microsoft.VSTS.TCM.ReproSteps
+	// instead of System.Description for their description content
+	jsonData := `{
+		"System.Title": "A bug",
+		"System.WorkItemType": "Bug",
+		"Microsoft.VSTS.TCM.ReproSteps": "<div>Steps to reproduce</div>"
+	}`
+
+	var fields WorkItemFields
+	if err := json.Unmarshal([]byte(jsonData), &fields); err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+
+	if fields.ReproSteps != "<div>Steps to reproduce</div>" {
+		t.Errorf("ReproSteps = %q, want %q", fields.ReproSteps, "<div>Steps to reproduce</div>")
+	}
+}
+
+func TestWorkItem_EffectiveDescription(t *testing.T) {
+	tests := []struct {
+		name         string
+		workItemType string
+		description  string
+		reproSteps   string
+		want         string
+	}{
+		{
+			name:         "Bug with ReproSteps uses ReproSteps",
+			workItemType: "Bug",
+			description:  "",
+			reproSteps:   "Steps to reproduce the bug",
+			want:         "Steps to reproduce the bug",
+		},
+		{
+			name:         "Bug with both fields uses ReproSteps",
+			workItemType: "Bug",
+			description:  "Some description",
+			reproSteps:   "Steps to reproduce",
+			want:         "Steps to reproduce",
+		},
+		{
+			name:         "Bug with only Description falls back to Description",
+			workItemType: "Bug",
+			description:  "Bug description",
+			reproSteps:   "",
+			want:         "Bug description",
+		},
+		{
+			name:         "Task uses Description",
+			workItemType: "Task",
+			description:  "Task description",
+			reproSteps:   "",
+			want:         "Task description",
+		},
+		{
+			name:         "User Story uses Description",
+			workItemType: "User Story",
+			description:  "Story description",
+			reproSteps:   "",
+			want:         "Story description",
+		},
+		{
+			name:         "Bug with neither field returns empty",
+			workItemType: "Bug",
+			description:  "",
+			reproSteps:   "",
+			want:         "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wi := WorkItem{
+				Fields: WorkItemFields{
+					WorkItemType: tt.workItemType,
+					Description:  tt.description,
+					ReproSteps:   tt.reproSteps,
+				},
+			}
+			got := wi.EffectiveDescription()
+			if got != tt.want {
+				t.Errorf("EffectiveDescription() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClient_GetWorkItems_RequestsReproStepsField(t *testing.T) {
+	var capturedPath string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.String()
+		response := WorkItemsResponse{
+			Count: 1,
+			Value: []WorkItem{
+				{ID: 1, Fields: WorkItemFields{Title: "Bug", WorkItemType: "Bug"}},
+			},
+		}
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	_, err := client.GetWorkItems([]int{1})
+	if err != nil {
+		t.Fatalf("GetWorkItems() error = %v", err)
+	}
+
+	if !strings.Contains(capturedPath, "Microsoft.VSTS.TCM.ReproSteps") {
+		t.Errorf("GetWorkItems request must include Microsoft.VSTS.TCM.ReproSteps field.\nGot path: %s", capturedPath)
+	}
+}
+
+func TestClient_QueryWorkItemIDs(t *testing.T) {
+	// Create mock server
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify request
+		if r.Method != "POST" {
+			t.Errorf("Expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/test-org/test-project/_apis/wit/wiql" {
+			t.Errorf("Unexpected path: %s", r.URL.Path)
+		}
+
+		// Return mock response
+		response := WIQLResponse{
+			WorkItems: []WorkItemReference{
+				{ID: 123, URL: "http://example.com/123"},
+				{ID: 456, URL: "http://example.com/456"},
+			},
+		}
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	// Create client with mock server
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	ids, err := client.QueryWorkItemIDs("SELECT [System.Id] FROM WorkItems", 50)
+	if err != nil {
+		t.Fatalf("QueryWorkItemIDs() error = %v", err)
+	}
+
+	if len(ids) != 2 {
+		t.Errorf("Expected 2 IDs, got %d", len(ids))
+	}
+	if ids[0] != 123 || ids[1] != 456 {
+		t.Errorf("Expected [123, 456], got %v", ids)
+	}
+}
+
+func TestClient_GetWorkItems(t *testing.T) {
+	// Create mock server
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify request
+		if r.Method != "GET" {
+			t.Errorf("Expected GET, got %s", r.Method)
+		}
+
+		// Return mock response
+		response := WorkItemsResponse{
+			Count: 2,
+			Value: []WorkItem{
+				{
+					ID:  123,
+					Rev: 1,
+					Fields: WorkItemFields{
+						Title:        "Fix bug",
+						State:        "Active",
+						WorkItemType: "Bug",
+						Priority:     1,
+					},
+				},
+				{
+					ID:  456,
+					Rev: 2,
+					Fields: WorkItemFields{
+						Title:        "Add feature",
+						State:        "New",
+						WorkItemType: "Task",
+						Priority:     2,
+					},
+				},
+			},
+		}
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	// Create client with mock server
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	workItems, err := client.GetWorkItems([]int{123, 456})
+	if err != nil {
+		t.Fatalf("GetWorkItems() error = %v", err)
+	}
+
+	if len(workItems) != 2 {
+		t.Errorf("Expected 2 work items, got %d", len(workItems))
+	}
+	if workItems[0].ID != 123 || workItems[0].Fields.Title != "Fix bug" {
+		t.Errorf("Work item 0 mismatch: %+v", workItems[0])
+	}
+}
+
+func TestClient_GetWorkItems_EmptyIDs(t *testing.T) {
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    "http://example.com",
+		httpClient: http.DefaultClient,
+	}
+
+	workItems, err := client.GetWorkItems([]int{})
+	if err != nil {
+		t.Fatalf("GetWorkItems() error = %v", err)
+	}
+
+	if len(workItems) != 0 {
+		t.Errorf("Expected empty slice, got %d items", len(workItems))
+	}
+}
+
+func TestClient_ListWorkItems_QueryScopedToProject(t *testing.T) {
+	// Verify the WIQL query includes project scoping to prevent duplicates
+	// when multiple project clients query simultaneously
+	var capturedBody string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			bodyBytes, _ := io.ReadAll(r.Body)
+			capturedBody = string(bodyBytes)
+			response := WIQLResponse{
+				WorkItems: []WorkItemReference{
+					{ID: 100, URL: "http://example.com/100"},
+				},
+			}
+			json.NewEncoder(w).Encode(response)
+		} else {
+			response := WorkItemsResponse{
+				Count: 1,
+				Value: []WorkItem{
+					{ID: 100, Fields: WorkItemFields{Title: "Item 1", State: "Active"}},
+				},
+			}
+			json.NewEncoder(w).Encode(response)
+		}
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	_, err := client.ListWorkItems(50)
+	if err != nil {
+		t.Fatalf("ListWorkItems() error = %v", err)
+	}
+
+	if !strings.Contains(capturedBody, "@project") {
+		t.Errorf("WIQL query must scope to @project to prevent duplicates in multi-project mode.\nGot query body: %s", capturedBody)
+	}
+}
+
+func TestClient_ListWorkItems(t *testing.T) {
+	callCount := 0
+
+	// Create mock server that handles both WIQL and workitems endpoints
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+
+		if r.Method == "POST" {
+			// WIQL endpoint
+			response := WIQLResponse{
+				WorkItems: []WorkItemReference{
+					{ID: 100, URL: "http://example.com/100"},
+					{ID: 200, URL: "http://example.com/200"},
+				},
+			}
+			json.NewEncoder(w).Encode(response)
+		} else {
+			// GetWorkItems endpoint
+			response := WorkItemsResponse{
+				Count: 2,
+				Value: []WorkItem{
+					{ID: 100, Fields: WorkItemFields{Title: "Item 1", State: "Active"}},
+					{ID: 200, Fields: WorkItemFields{Title: "Item 2", State: "New"}},
+				},
+			}
+			json.NewEncoder(w).Encode(response)
+		}
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	workItems, err := client.ListWorkItems(50)
+	if err != nil {
+		t.Fatalf("ListWorkItems() error = %v", err)
+	}
+
+	if len(workItems) != 2 {
+		t.Errorf("Expected 2 work items, got %d", len(workItems))
+	}
+	if callCount != 2 {
+		t.Errorf("Expected 2 API calls (WIQL + GetWorkItems), got %d", callCount)
+	}
+}
+
+func TestClient_ListMyWorkItems_QueryContainsAtMe(t *testing.T) {
+	var capturedBody string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			bodyBytes, _ := io.ReadAll(r.Body)
+			capturedBody = string(bodyBytes)
+			response := WIQLResponse{WorkItems: []WorkItemReference{}}
+			json.NewEncoder(w).Encode(response)
+		}
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	_, err := client.ListMyWorkItems(50)
+	if err != nil {
+		t.Fatalf("ListMyWorkItems() error = %v", err)
+	}
+
+	if !strings.Contains(capturedBody, "@Me") {
+		t.Errorf("WIQL query must contain @Me macro.\nGot query body: %s", capturedBody)
+	}
+	if !strings.Contains(capturedBody, "@project") {
+		t.Errorf("WIQL query must scope to @project.\nGot query body: %s", capturedBody)
+	}
+}
+
+func TestClient_ListWorkItems_NoResults(t *testing.T) {
+	// Create mock server that returns empty WIQL results
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		response := WIQLResponse{
+			WorkItems: []WorkItemReference{},
+		}
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	workItems, err := client.ListWorkItems(50)
+	if err != nil {
+		t.Fatalf("ListWorkItems() error = %v", err)
+	}
+
+	if len(workItems) != 0 {
+		t.Errorf("Expected 0 work items, got %d", len(workItems))
+	}
+}
+
+func TestClient_GetWorkItemTypeStates(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			t.Errorf("Expected GET, got %s", r.Method)
+		}
+		if !strings.Contains(r.URL.Path, "/wit/workitemtypes/Bug/states") {
+			t.Errorf("Unexpected path: %s", r.URL.Path)
+		}
+
+		response := WorkItemTypeStatesResponse{
+			Count: 4,
+			Value: []WorkItemTypeState{
+				{Name: "New", Color: "b2b2b2", Category: "Proposed"},
+				{Name: "Active", Color: "007acc", Category: "InProgress"},
+				{Name: "Resolved", Color: "ff9d00", Category: "Resolved"},
+				{Name: "Closed", Color: "339933", Category: "Completed"},
+			},
+		}
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	states, err := client.GetWorkItemTypeStates("Bug")
+	if err != nil {
+		t.Fatalf("GetWorkItemTypeStates() error = %v", err)
+	}
+
+	if len(states) != 4 {
+		t.Fatalf("Expected 4 states, got %d", len(states))
+	}
+	if states[0].Name != "New" {
+		t.Errorf("Expected first state 'New', got %q", states[0].Name)
+	}
+	if states[0].Category != "Proposed" {
+		t.Errorf("Expected category 'Proposed', got %q", states[0].Category)
+	}
+}
+
+func TestClient_GetWorkItemTypeStates_ExcludesRemovedCategory(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		response := WorkItemTypeStatesResponse{
+			Count: 5,
+			Value: []WorkItemTypeState{
+				{Name: "New", Color: "b2b2b2", Category: "Proposed"},
+				{Name: "Active", Color: "007acc", Category: "InProgress"},
+				{Name: "Resolved", Color: "ff9d00", Category: "Resolved"},
+				{Name: "Closed", Color: "339933", Category: "Completed"},
+				{Name: "Removed", Color: "ffffff", Category: "Removed"},
+			},
+		}
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	states, err := client.GetWorkItemTypeStates("Bug")
+	if err != nil {
+		t.Fatalf("GetWorkItemTypeStates() error = %v", err)
+	}
+
+	for _, s := range states {
+		if s.Category == "Removed" {
+			t.Errorf("GetWorkItemTypeStates should exclude 'Removed' category, but found state %q", s.Name)
+		}
+	}
+}
+
+func TestClient_CreateWorkItem(t *testing.T) {
+	var gotContentType string
+	var gotPath string
+	var gotPatch []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentType = r.Header.Get("Content-Type")
+		gotPath = r.URL.EscapedPath()
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("reading request body: %v", err)
+			return
+		}
+		if err := json.Unmarshal(body, &gotPatch); err != nil {
+			t.Errorf("decoding JSON Patch: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":321,"fields":{"System.Title":"Created item"}}`))
+	}))
+	defer server.Close()
+
+	client := &Client{baseURL: server.URL, httpClient: http.DefaultClient}
+	item, err := client.CreateWorkItem("User Story", "Created item", "Description", "user@example.com")
+	if err != nil {
+		t.Fatalf("CreateWorkItem() error = %v", err)
+	}
+	if gotPath != "/wit/workitems/$User%20Story" {
+		t.Errorf("request path = %q, want escaped work-item type path", gotPath)
+	}
+	if gotContentType != "application/json-patch+json" {
+		t.Errorf("Content-Type = %q, want application/json-patch+json", gotContentType)
+	}
+	if len(gotPatch) != 3 ||
+		gotPatch[0]["path"] != "/fields/System.Title" ||
+		gotPatch[0]["value"] != "Created item" ||
+		gotPatch[1]["path"] != "/fields/System.Description" ||
+		gotPatch[1]["value"] != "Description" ||
+		gotPatch[2]["path"] != "/fields/System.AssignedTo" ||
+		gotPatch[2]["value"] != "user@example.com" {
+		t.Errorf("JSON Patch = %#v, want title, description, and assignee operations", gotPatch)
+	}
+	if item.ID != 321 || item.Fields.Title != "Created item" {
+		t.Errorf("created item = %#v, want ID 321 and title", item)
+	}
+}
+
+func TestClient_CreateWorkItem_RequiresTypeAndTitle(t *testing.T) {
+	client := &Client{}
+	for _, tt := range []struct {
+		name, itemType, title string
+	}{
+		{name: "type", title: "title"},
+		{name: "title", itemType: "Task"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := client.CreateWorkItem(tt.itemType, tt.title, "", ""); err == nil {
+				t.Fatal("CreateWorkItem() error = nil, want validation error")
+			}
+		})
+	}
+}
+
+func TestClient_CreateBug_UsesReproStepsForDescription(t *testing.T) {
+	var gotPatch []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &gotPatch); err != nil {
+			t.Errorf("decoding JSON Patch: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"id":321,"fields":{"System.Title":"Bug"}}`))
+	}))
+	defer server.Close()
+
+	client := &Client{baseURL: server.URL, httpClient: http.DefaultClient}
+	if _, err := client.CreateWorkItem("Bug", "Bug", "Steps to reproduce", ""); err != nil {
+		t.Fatalf("CreateWorkItem() error = %v", err)
+	}
+	if len(gotPatch) != 2 || gotPatch[1]["path"] != "/fields/Microsoft.VSTS.TCM.ReproSteps" {
+		t.Errorf("JSON Patch = %#v, want bug repro-steps field", gotPatch)
+	}
+}
+
+func TestClient_UpdateWorkItemState(t *testing.T) {
+	var capturedBody string
+	var capturedContentType string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "PATCH" {
+			t.Errorf("Expected PATCH, got %s", r.Method)
+		}
+		capturedContentType = r.Header.Get("Content-Type")
+		bodyBytes, _ := io.ReadAll(r.Body)
+		capturedBody = string(bodyBytes)
+
+		response := WorkItem{
+			ID:  123,
+			Rev: 2,
+			Fields: WorkItemFields{
+				Title: "Fix bug",
+				State: "Resolved",
+			},
+		}
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	err := client.UpdateWorkItemState(123, "Resolved")
+	if err != nil {
+		t.Fatalf("UpdateWorkItemState() error = %v", err)
+	}
+
+	if capturedContentType != "application/json-patch+json" {
+		t.Errorf("Expected Content-Type 'application/json-patch+json', got %q", capturedContentType)
+	}
+
+	if !strings.Contains(capturedBody, "/fields/System.State") {
+		t.Errorf("Expected body to contain '/fields/System.State', got %s", capturedBody)
+	}
+	if !strings.Contains(capturedBody, "Resolved") {
+		t.Errorf("Expected body to contain 'Resolved', got %s", capturedBody)
+	}
+}
+
+func TestWorkItemFields_TagsDeserialization(t *testing.T) {
+	// Azure DevOps returns tags as a semicolon-separated string in System.Tags
+	jsonData := `{
+		"System.Title": "Tagged item",
+		"System.Tags": "Sprint 5; Frontend; Critical"
+	}`
+
+	var fields WorkItemFields
+	if err := json.Unmarshal([]byte(jsonData), &fields); err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+
+	if fields.Tags != "Sprint 5; Frontend; Critical" {
+		t.Errorf("Tags = %q, want %q", fields.Tags, "Sprint 5; Frontend; Critical")
+	}
+}
+
+func TestWorkItemFields_TagsDeserialization_Empty(t *testing.T) {
+	// When no tags are set, the field should be empty
+	jsonData := `{
+		"System.Title": "No tags"
+	}`
+
+	var fields WorkItemFields
+	if err := json.Unmarshal([]byte(jsonData), &fields); err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+
+	if fields.Tags != "" {
+		t.Errorf("Tags = %q, want empty string", fields.Tags)
+	}
+}
+
+func TestWorkItem_TagList(t *testing.T) {
+	tests := []struct {
+		name string
+		tags string
+		want []string
+	}{
+		{
+			name: "multiple tags",
+			tags: "Sprint 5; Frontend; Critical",
+			want: []string{"Sprint 5", "Frontend", "Critical"},
+		},
+		{
+			name: "single tag",
+			tags: "Backend",
+			want: []string{"Backend"},
+		},
+		{
+			name: "empty tags",
+			tags: "",
+			want: nil,
+		},
+		{
+			name: "tags with extra whitespace",
+			tags: "  Sprint 5 ;  Frontend ;  Critical  ",
+			want: []string{"Sprint 5", "Frontend", "Critical"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wi := WorkItem{Fields: WorkItemFields{Tags: tt.tags}}
+			got := wi.TagList()
+			if len(got) != len(tt.want) {
+				t.Fatalf("TagList() returned %d tags, want %d", len(got), len(tt.want))
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("TagList()[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestClient_GetWorkItems_RequestsTagsField(t *testing.T) {
+	var capturedPath string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.String()
+		response := WorkItemsResponse{
+			Count: 1,
+			Value: []WorkItem{
+				{ID: 1, Fields: WorkItemFields{Title: "Item", Tags: "tag1; tag2"}},
+			},
+		}
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	_, err := client.GetWorkItems([]int{1})
+	if err != nil {
+		t.Fatalf("GetWorkItems() error = %v", err)
+	}
+
+	if !strings.Contains(capturedPath, "System.Tags") {
+		t.Errorf("GetWorkItems request must include System.Tags field.\nGot path: %s", capturedPath)
+	}
+}
+
+func TestWorkItem_TimeInCurrentState(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name            string
+		stateChangeDate time.Time
+		want            time.Duration
+	}{
+		{
+			name:            "zero StateChangeDate returns 0",
+			stateChangeDate: time.Time{},
+			want:            0,
+		},
+		{
+			name:            "3 days ago",
+			stateChangeDate: now.Add(-3 * 24 * time.Hour),
+			want:            3 * 24 * time.Hour,
+		},
+		{
+			name:            "2 hours ago",
+			stateChangeDate: now.Add(-2 * time.Hour),
+			want:            2 * time.Hour,
+		},
+		{
+			name:            "exactly now",
+			stateChangeDate: now,
+			want:            0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wi := WorkItem{Fields: WorkItemFields{StateChangeDate: tt.stateChangeDate}}
+			got := wi.TimeInCurrentState(now)
+			if got != tt.want {
+				t.Errorf("TimeInCurrentState() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWorkItem_EffectivePoints(t *testing.T) {
+	tests := []struct {
+		name        string
+		storyPoints float64
+		want        float64
+	}{
+		{name: "zero points", storyPoints: 0, want: 0},
+		{name: "small integer points", storyPoints: 3, want: 3},
+		{name: "fractional points", storyPoints: 1.5, want: 1.5},
+		{name: "large points", storyPoints: 21, want: 21},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wi := WorkItem{Fields: WorkItemFields{StoryPoints: tt.storyPoints}}
+			got := wi.EffectivePoints()
+			if got != tt.want {
+				t.Errorf("EffectivePoints() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWorkItem_IsCompletedSince(t *testing.T) {
+	start := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name       string
+		state      string
+		closedDate time.Time
+		want       bool
+	}{
+		{
+			name:       "active item is never completed",
+			state:      "Active",
+			closedDate: start.Add(5 * 24 * time.Hour),
+			want:       false,
+		},
+		{
+			name:       "closed item with zero ClosedDate",
+			state:      "Closed",
+			closedDate: time.Time{},
+			want:       false,
+		},
+		{
+			name:       "closed before interval start",
+			state:      "Closed",
+			closedDate: start.Add(-1 * 24 * time.Hour),
+			want:       false,
+		},
+		{
+			name:       "closed exactly at interval start is excluded",
+			state:      "Closed",
+			closedDate: start,
+			want:       false,
+		},
+		{
+			name:       "closed inside the interval",
+			state:      "Closed",
+			closedDate: start.Add(3 * 24 * time.Hour),
+			want:       true,
+		},
+		{
+			name:       "case-insensitive state match",
+			state:      "closed",
+			closedDate: start.Add(3 * 24 * time.Hour),
+			want:       true,
+		},
+		{
+			name:       "new state is not completed",
+			state:      "New",
+			closedDate: start.Add(3 * 24 * time.Hour),
+			want:       false,
+		},
+		{
+			name:       "ready for test is not completed",
+			state:      "Ready for Test",
+			closedDate: start.Add(3 * 24 * time.Hour),
+			want:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wi := WorkItem{Fields: WorkItemFields{
+				State:      tt.state,
+				ClosedDate: tt.closedDate,
+			}}
+			got := wi.IsCompletedSince(start)
+			if got != tt.want {
+				t.Errorf("IsCompletedSince() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClient_GetWorkItems_RequestsMetricsFields(t *testing.T) {
+	var capturedPath string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.String()
+		response := WorkItemsResponse{
+			Count: 1,
+			Value: []WorkItem{{ID: 1, Fields: WorkItemFields{Title: "Item"}}},
+		}
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	_, err := client.GetWorkItems([]int{1})
+	if err != nil {
+		t.Fatalf("GetWorkItems() error = %v", err)
+	}
+
+	required := []string{
+		"Microsoft.VSTS.Scheduling.StoryPoints",
+		"Microsoft.VSTS.Common.StateChangeDate",
+		"Microsoft.VSTS.Common.ActivatedDate",
+		"Microsoft.VSTS.Common.ClosedDate",
+		"System.CreatedDate",
+	}
+	for _, f := range required {
+		if !strings.Contains(capturedPath, f) {
+			t.Errorf("GetWorkItems request must include %s field.\nGot path: %s", f, capturedPath)
+		}
+	}
+}
+
+func TestClient_UpdateWorkItemState_APIError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	err := client.UpdateWorkItemState(123, "InvalidState")
+	if err == nil {
+		t.Error("Expected error for bad request, got nil")
+	}
+}
+
+// TestClient_ListRecentlyMentionedWorkItems_SortsByChangedDateDescending
+// pins the fix for the task 5 review's 🔴: the WIQL query's ORDER BY only
+// sorts the ids QueryWorkItemIDs returns, not the work items GetWorkItems
+// fetches next — the GET /wit/workitems batch endpoint returns
+// response.Value in its own order, unrelated to the ids list's order. The
+// mock below models that directly: the WIQL response lists ids ascending
+// (1, 2, 3) but the batch GetWorkItems response deliberately returns them in
+// an unrelated order (3, 1, 2) that does not match either the WIQL order or
+// ChangedDate order. If ListRecentlyMentionedWorkItems returned
+// GetWorkItems' response order unsorted, this test would observe [3, 1, 2]
+// (or, under an id-order-preserving fixture, would never catch the defect
+// at all — see the phase-2 notifications spec's task 5 review feedback).
+// Only an explicit post-fetch sort by Fields.ChangedDate descending recovers
+// the correct [newest ID 3, middle ID 2, oldest ID 1] order asserted here.
+func TestClient_ListRecentlyMentionedWorkItems_SortsByChangedDateDescending(t *testing.T) {
+	oldest := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	middle := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	newest := time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			// WIQL: ids returned in ascending order, unrelated to ChangedDate.
+			response := WIQLResponse{
+				WorkItems: []WorkItemReference{{ID: 1}, {ID: 2}, {ID: 3}},
+			}
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+		// GetWorkItems batch: deliberately not in request order (1,2,3) and
+		// not in ChangedDate order either, modelling the batch endpoint's
+		// own independent ordering.
+		response := WorkItemsResponse{
+			Value: []WorkItem{
+				{ID: 3, Fields: WorkItemFields{Title: "Newest", ChangedDate: newest}},
+				{ID: 1, Fields: WorkItemFields{Title: "Oldest", ChangedDate: oldest}},
+				{ID: 2, Fields: WorkItemFields{Title: "Middle", ChangedDate: middle}},
+			},
+		}
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	items, err := client.ListRecentlyMentionedWorkItems(50)
+	if err != nil {
+		t.Fatalf("ListRecentlyMentionedWorkItems() error = %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("expected 3 work items, got %d", len(items))
+	}
+
+	wantOrder := []int{3, 2, 1} // newest ChangedDate first
+	for i, wantID := range wantOrder {
+		if items[i].ID != wantID {
+			t.Errorf("items[%d].ID = %d, want %d (ChangedDate descending)", i, items[i].ID, wantID)
+		}
+	}
+}
+
+// TestClient_ListRecentlyAssignedWorkItems_SortsByChangedDateDescending
+// mirrors TestClient_ListRecentlyMentionedWorkItems_SortsByChangedDateDescending's
+// fix for the same trap (see that test's doc comment): the WIQL query's
+// ORDER BY only sorts the ids QueryWorkItemIDs returns, not the work items
+// GetWorkItems fetches next. The WIQL response here lists ids ascending
+// (1, 2, 3) but the batch GetWorkItems response deliberately returns them in
+// an unrelated order (3, 1, 2) that matches neither the WIQL order nor
+// ChangedDate order — only an explicit post-fetch sort by Fields.ChangedDate
+// descending recovers the correct [3, 2, 1] order asserted below.
+func TestClient_ListRecentlyAssignedWorkItems_SortsByChangedDateDescending(t *testing.T) {
+	oldest := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	middle := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	newest := time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			response := WIQLResponse{
+				WorkItems: []WorkItemReference{{ID: 1}, {ID: 2}, {ID: 3}},
+			}
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+		response := WorkItemsResponse{
+			Value: []WorkItem{
+				{ID: 3, Fields: WorkItemFields{Title: "Newest", ChangedDate: newest}},
+				{ID: 1, Fields: WorkItemFields{Title: "Oldest", ChangedDate: oldest}},
+				{ID: 2, Fields: WorkItemFields{Title: "Middle", ChangedDate: middle}},
+			},
+		}
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	items, err := client.ListRecentlyAssignedWorkItems(14, 50)
+	if err != nil {
+		t.Fatalf("ListRecentlyAssignedWorkItems() error = %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("expected 3 work items, got %d", len(items))
+	}
+
+	wantOrder := []int{3, 2, 1} // newest ChangedDate first
+	for i, wantID := range wantOrder {
+		if items[i].ID != wantID {
+			t.Errorf("items[%d].ID = %d, want %d (ChangedDate descending)", i, items[i].ID, wantID)
+		}
+	}
+}
+
+// TestClient_ListRecentlyAssignedWorkItems_QueryContainsLookbackWindow pins
+// that lookbackDays is threaded into the WIQL query as the literal N in
+// `@Today-N`, and that the query still scopes to @Me and @project — decision
+// 6's bounded lookback window (no snapshot, no delta state) only bounds the
+// feed if N actually reaches the query Azure evaluates server-side.
+func TestClient_ListRecentlyAssignedWorkItems_QueryContainsLookbackWindow(t *testing.T) {
+	var capturedBody string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			bodyBytes, _ := io.ReadAll(r.Body)
+			capturedBody = string(bodyBytes)
+			response := WIQLResponse{WorkItems: []WorkItemReference{}}
+			json.NewEncoder(w).Encode(response)
+		}
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	_, err := client.ListRecentlyAssignedWorkItems(21, 50)
+	if err != nil {
+		t.Fatalf("ListRecentlyAssignedWorkItems() error = %v", err)
+	}
+
+	if !strings.Contains(capturedBody, "@Today-21") {
+		t.Errorf("WIQL query must bound the lookback window via @Today-21, got query body: %s", capturedBody)
+	}
+	if !strings.Contains(capturedBody, "@Me") {
+		t.Errorf("WIQL query must scope to @Me, got query body: %s", capturedBody)
+	}
+	if !strings.Contains(capturedBody, "@project") {
+		t.Errorf("WIQL query must scope to @project to prevent duplicates in multi-project mode, got query body: %s", capturedBody)
+	}
+}
+
+// TestClient_ListRecentlyAssignedWorkItems_QueryExcludesClosedAndRemoved
+// pins that the state clause matches ListMyWorkItems (workitems.go:261-266)
+// exactly. Without it, closing a work item advances System.ChangedDate (a
+// close is itself a revision), so the item would match this query again on
+// the very next poll and resurrect as unread — inverting decision 7's
+// auto-expiry.
+func TestClient_ListRecentlyAssignedWorkItems_QueryExcludesClosedAndRemoved(t *testing.T) {
+	var capturedBody string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			bodyBytes, _ := io.ReadAll(r.Body)
+			capturedBody = string(bodyBytes)
+			response := WIQLResponse{WorkItems: []WorkItemReference{}}
+			json.NewEncoder(w).Encode(response)
+		}
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	_, err := client.ListRecentlyAssignedWorkItems(14, 50)
+	if err != nil {
+		t.Fatalf("ListRecentlyAssignedWorkItems() error = %v", err)
+	}
+
+	// The request body is JSON-encoded, which escapes `<`/`>` to
+	// `<`/`>` — decode it back to the literal query text before
+	// asserting on it, rather than matching the escaped form.
+	var decoded struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal([]byte(capturedBody), &decoded); err != nil {
+		t.Fatalf("failed to decode captured WIQL request body: %v", err)
+	}
+
+	if !strings.Contains(decoded.Query, "[System.State] <> 'Closed'") {
+		t.Errorf("WIQL query must exclude Closed items, got query: %s", decoded.Query)
+	}
+	if !strings.Contains(decoded.Query, "[System.State] <> 'Removed'") {
+		t.Errorf("WIQL query must exclude Removed items, got query: %s", decoded.Query)
+	}
+}
+
+// TestClient_ListRecentlyAssignedWorkItems_NegativeLookbackDays_ClampsToZero
+// pins that a negative lookbackDays is clamped to 0 rather than interpolated
+// as-is: `@Today--5` is malformed WIQL and would fail with HTTP 400 on
+// every project, degrading this source to nothing.
+func TestClient_ListRecentlyAssignedWorkItems_NegativeLookbackDays_ClampsToZero(t *testing.T) {
+	var capturedBody string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			bodyBytes, _ := io.ReadAll(r.Body)
+			capturedBody = string(bodyBytes)
+			response := WIQLResponse{WorkItems: []WorkItemReference{}}
+			json.NewEncoder(w).Encode(response)
+		}
+	}))
+	defer server.Close()
+
+	client := &Client{
+		org:        "test-org",
+		project:    "test-project",
+		pat:        "test-pat",
+		baseURL:    server.URL + "/test-org/test-project/_apis",
+		httpClient: http.DefaultClient,
+	}
+
+	_, err := client.ListRecentlyAssignedWorkItems(-5, 50)
+	if err != nil {
+		t.Fatalf("ListRecentlyAssignedWorkItems() error = %v", err)
+	}
+
+	if strings.Contains(capturedBody, "@Today--5") {
+		t.Errorf("negative lookbackDays must not reach the query as-is, got malformed query body: %s", capturedBody)
+	}
+	if !strings.Contains(capturedBody, "@Today-0") {
+		t.Errorf("negative lookbackDays must clamp to 0, got query body: %s", capturedBody)
+	}
+}

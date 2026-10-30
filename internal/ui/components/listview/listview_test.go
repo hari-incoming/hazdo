@@ -1,0 +1,1051 @@
+package listview
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/hari-incoming/hazdo/internal/ui/components"
+	"github.com/hari-incoming/hazdo/internal/ui/components/table"
+	"github.com/hari-incoming/hazdo/internal/ui/styles"
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+// testItem is a stub type for testing the generic list model.
+type testItem struct {
+	ID   int
+	Name string
+}
+
+// testDetailView is a stub implementing DetailView for testing.
+type testDetailView struct {
+	width, height int
+}
+
+func (d *testDetailView) Update(msg tea.Msg) (DetailView, tea.Cmd) {
+	return d, nil
+}
+
+func (d *testDetailView) View() string {
+	return "detail view content"
+}
+
+func (d *testDetailView) SetSize(width, height int) {
+	d.width = width
+	d.height = height
+}
+
+func (d *testDetailView) GetContextItems() []components.ContextItem {
+	return []components.ContextItem{{Key: "esc", Description: "back"}}
+}
+
+func (d *testDetailView) GetScrollPercent() float64 {
+	return 0.5
+}
+
+func (d *testDetailView) GetStatusMessage() string {
+	return "test status"
+}
+
+func testFilterFunc(item testItem, query string) bool {
+	q := strings.ToLower(query)
+	return strings.Contains(strings.ToLower(item.Name), q) ||
+		strings.Contains(fmt.Sprintf("%d", item.ID), q)
+}
+
+func testConfig() Config[testItem] {
+	return Config[testItem]{
+		Columns: []ColumnSpec{
+			{Title: "ID", WidthPct: 30, MinWidth: 6},
+			{Title: "Name", WidthPct: 70, MinWidth: 10},
+		},
+		LoadingMessage: "Loading test items...",
+		EntityName:     "test items",
+		MinWidth:       70,
+		ToRows: func(items []testItem, s *styles.Styles) []table.Row {
+			rows := make([]table.Row, len(items))
+			for i, item := range items {
+				rows[i] = table.Row{fmt.Sprintf("%d", item.ID), item.Name}
+			}
+			return rows
+		},
+		Fetch: func() tea.Cmd {
+			return func() tea.Msg { return nil }
+		},
+		EnterDetail: func(item testItem, s *styles.Styles, w, h int) (DetailView, tea.Cmd) {
+			d := &testDetailView{width: w, height: h}
+			return d, nil
+		},
+		FilterFunc: testFilterFunc,
+	}
+}
+
+func TestNew_InitialState(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+
+	if m.GetViewMode() != ViewList {
+		t.Errorf("Expected ViewList, got %v", m.GetViewMode())
+	}
+	if len(m.Items()) != 0 {
+		t.Errorf("Expected 0 items, got %d", len(m.Items()))
+	}
+	if m.styles == nil {
+		t.Error("Expected styles to be set")
+	}
+}
+
+func TestSetItems_ClearsLoadingAndError(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.loading = true
+	m.err = fmt.Errorf("previous error")
+
+	items := []testItem{{ID: 1, Name: "Alpha"}, {ID: 2, Name: "Beta"}}
+	m = m.SetItems(items)
+
+	if m.loading {
+		t.Error("Expected loading to be false after SetItems")
+	}
+	if m.err != nil {
+		t.Errorf("Expected err to be nil after SetItems, got %v", m.err)
+	}
+	if len(m.Items()) != 2 {
+		t.Errorf("Expected 2 items, got %d", len(m.Items()))
+	}
+}
+
+func TestHandleFetchResult_Success(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.loading = true
+
+	items := []testItem{{ID: 1, Name: "Alpha"}}
+	m = m.HandleFetchResult(items, nil)
+
+	if m.loading {
+		t.Error("Expected loading to be false after HandleFetchResult")
+	}
+	if m.err != nil {
+		t.Errorf("Expected err to be nil, got %v", m.err)
+	}
+	if len(m.Items()) != 1 {
+		t.Errorf("Expected 1 item, got %d", len(m.Items()))
+	}
+}
+
+func TestHandleFetchResult_Error(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.loading = true
+
+	mockErr := fmt.Errorf("fetch failed")
+	m = m.HandleFetchResult(nil, mockErr)
+
+	if m.loading {
+		t.Error("Expected loading to be false after error")
+	}
+	if m.err == nil {
+		t.Error("Expected err to be set after error")
+	}
+}
+
+// TestSetLoading_True pins the SetLoading(true) half: it sets the loading
+// field and shows the spinner, mirroring what Init() does today except that,
+// unlike Init(), SetLoading returns a mutated copy the caller can keep —
+// Init() cannot, because tea.Model.Init has a value receiver.
+func TestSetLoading_True(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+
+	m = m.SetLoading(true)
+
+	if !m.Loading() {
+		t.Error("Loading() = false after SetLoading(true)")
+	}
+	if !m.spinner.IsVisible() {
+		t.Error("spinner.Visible() = false after SetLoading(true)")
+	}
+}
+
+// TestSetLoading_False pins the reverse: hides the spinner and clears
+// loading, so a caller can use SetLoading(false) to cancel a construction-time
+// loading state without going through SetItems/HandleFetchResult.
+func TestSetLoading_False(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m = m.SetLoading(true)
+
+	m = m.SetLoading(false)
+
+	if m.Loading() {
+		t.Error("Loading() = true after SetLoading(false)")
+	}
+	if m.spinner.IsVisible() {
+		t.Error("spinner.Visible() = true after SetLoading(false)")
+	}
+}
+
+func TestView_Loading(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.loading = true
+	m.spinner.SetVisible(true)
+	m.width = 100
+	m.height = 30
+
+	view := m.View()
+	if !strings.Contains(view, "test items") || !strings.Contains(view, "quit") {
+		t.Errorf("Loading view should contain loading message and quit instruction, got: %q", view)
+	}
+}
+
+func TestView_Error(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.err = fmt.Errorf("something broke")
+	m.width = 100
+	m.height = 30
+
+	view := m.View()
+	if !strings.Contains(view, "Error") {
+		t.Error("Error view should contain 'Error'")
+	}
+	if !strings.Contains(view, "test items") {
+		t.Error("Error view should contain entity name")
+	}
+}
+
+func TestView_Empty(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.items = []testItem{}
+	m.width = 100
+	m.height = 30
+
+	view := m.View()
+	if !strings.Contains(view, "No test items") {
+		t.Error("Empty view should contain 'No test items'")
+	}
+}
+
+func TestView_WithItems(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.width = 100
+	m.height = 30
+
+	items := []testItem{{ID: 1, Name: "Alpha"}}
+	m = m.SetItems(items)
+
+	// Resize so table has proper dimensions
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	view := m.View()
+	// Table view should render (not error/loading/empty)
+	if strings.Contains(view, "Error") || strings.Contains(view, "No test items") {
+		t.Errorf("Expected table view, got: %q", view)
+	}
+}
+
+func TestUpdate_EnterNavigatesToDetail(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.width = 100
+	m.height = 30
+
+	items := []testItem{{ID: 1, Name: "Alpha"}}
+	m = m.SetItems(items)
+
+	// Press enter to navigate to detail
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.GetViewMode() != ViewDetail {
+		t.Errorf("Expected ViewDetail after Enter, got %v", m.GetViewMode())
+	}
+	if m.detail == nil {
+		t.Error("Expected detail to be set")
+	}
+}
+
+func TestUpdate_EscReturnsToList(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.width = 100
+	m.height = 30
+
+	items := []testItem{{ID: 1, Name: "Alpha"}}
+	m = m.SetItems(items)
+
+	// Enter detail
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.GetViewMode() != ViewDetail {
+		t.Fatalf("Expected ViewDetail, got %v", m.GetViewMode())
+	}
+
+	// Esc back to list
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.GetViewMode() != ViewList {
+		t.Errorf("Expected ViewList after Esc, got %v", m.GetViewMode())
+	}
+	if m.detail != nil {
+		t.Error("Expected detail to be nil after Esc")
+	}
+}
+
+func TestUpdate_RefreshKey(t *testing.T) {
+	s := styles.DefaultStyles()
+	fetchCalled := false
+	cfg := testConfig()
+	cfg.Fetch = func() tea.Cmd {
+		fetchCalled = true
+		return func() tea.Msg { return nil }
+	}
+	m := New(cfg, s)
+
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+
+	if !fetchCalled {
+		t.Error("Expected Fetch to be called on 'r' key")
+	}
+	if !m.loading {
+		t.Error("Expected loading to be true after refresh")
+	}
+}
+
+func TestUpdate_WindowResize(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	if m.width != 120 {
+		t.Errorf("Expected width 120, got %d", m.width)
+	}
+	if m.height != 40 {
+		t.Errorf("Expected height 40, got %d", m.height)
+	}
+}
+
+func TestGetContextItems_ListMode(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+
+	items := m.GetContextItems()
+	if items != nil {
+		t.Error("Expected nil context items in list mode")
+	}
+}
+
+func TestGetContextItems_DetailMode(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.width = 100
+	m.height = 30
+
+	m = m.SetItems([]testItem{{ID: 1, Name: "Alpha"}})
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	items := m.GetContextItems()
+	if len(items) != 1 || items[0].Key != "esc" {
+		t.Errorf("Expected detail context items, got %v", items)
+	}
+}
+
+func TestMouseDoubleClickOpensSelectedRow(t *testing.T) {
+	s := styles.DefaultStyles()
+	cfg := testConfig()
+	cfg.OpenOnDoubleClick = true
+	m := New(cfg, s).SetItems([]testItem{
+		{ID: 1, Name: "Alpha"},
+		{ID: 2, Name: "Beta"},
+	})
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	click := tea.MouseMsg{
+		Y:      1, // Header is row 0; this is the first data row.
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	}
+
+	m, _ = m.Update(click)
+	if m.GetViewMode() != ViewList {
+		t.Fatal("single click should select a row without opening detail")
+	}
+	m, _ = m.Update(click)
+	if m.GetViewMode() != ViewDetail {
+		t.Fatal("double click on the same row should open detail")
+	}
+}
+
+func TestMouseDoubleClickOpensFilteredRow(t *testing.T) {
+	cfg := testConfig()
+	cfg.OpenOnDoubleClick = true
+	m := New(cfg, styles.DefaultStyles()).SetItems([]testItem{
+		{ID: 1, Name: "Alpha"},
+		{ID: 2, Name: "Beta"},
+	})
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	for _, r := range "beta" {
+		m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	click := tea.MouseMsg{Y: 1, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress}
+	m, _ = m.Update(click)
+	m, _ = m.Update(click)
+	if m.GetViewMode() != ViewDetail {
+		t.Fatal("double-click on a filtered result should open its detail")
+	}
+}
+
+func TestMouseWheelMovesSelection(t *testing.T) {
+	m := New(testConfig(), styles.DefaultStyles()).SetItems([]testItem{
+		{ID: 1, Name: "Alpha"},
+		{ID: 2, Name: "Beta"},
+		{ID: 3, Name: "Gamma"},
+	})
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	m, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress})
+	if got := m.SelectedIndex(); got != 1 {
+		t.Fatalf("selection after wheel down = %d, want 1", got)
+	}
+
+	m, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp, Action: tea.MouseActionPress})
+	if got := m.SelectedIndex(); got != 0 {
+		t.Fatalf("selection after wheel up = %d, want 0", got)
+	}
+}
+
+func TestGetScrollPercent_ListMode(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+
+	if m.GetScrollPercent() != 0 {
+		t.Errorf("Expected 0 scroll percent in list mode, got %f", m.GetScrollPercent())
+	}
+}
+
+func TestGetScrollPercent_DetailMode(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.width = 100
+	m.height = 30
+
+	m = m.SetItems([]testItem{{ID: 1, Name: "Alpha"}})
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.GetScrollPercent() != 0.5 {
+		t.Errorf("Expected 0.5 scroll percent in detail mode, got %f", m.GetScrollPercent())
+	}
+}
+
+func TestGetStatusMessage_ListMode(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+
+	if m.GetStatusMessage() != "" {
+		t.Errorf("Expected empty status message, got %q", m.GetStatusMessage())
+	}
+}
+
+func TestGetStatusMessage_DetailMode(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.width = 100
+	m.height = 30
+
+	m = m.SetItems([]testItem{{ID: 1, Name: "Alpha"}})
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.GetStatusMessage() != "test status" {
+		t.Errorf("Expected 'test status', got %q", m.GetStatusMessage())
+	}
+}
+
+func TestHasContextBar_Default(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+
+	if m.HasContextBar() {
+		t.Error("Expected no context bar by default")
+	}
+}
+
+func TestHasContextBar_WithCallback(t *testing.T) {
+	s := styles.DefaultStyles()
+	cfg := testConfig()
+	cfg.HasContextBar = func(mode ViewMode) bool {
+		return mode == ViewDetail
+	}
+	m := New(cfg, s)
+	m.width = 100
+	m.height = 30
+
+	if m.HasContextBar() {
+		t.Error("Expected no context bar in list mode")
+	}
+
+	m = m.SetItems([]testItem{{ID: 1, Name: "Alpha"}})
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if !m.HasContextBar() {
+		t.Error("Expected context bar in detail mode")
+	}
+}
+
+func TestSelectedIndex(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+
+	items := []testItem{{ID: 1, Name: "Alpha"}, {ID: 2, Name: "Beta"}}
+	m = m.SetItems(items)
+
+	idx := m.SelectedIndex()
+	if idx != 0 {
+		t.Errorf("Expected selected index 0, got %d", idx)
+	}
+}
+
+// TestErr_ReflectsHandleFetchResult pins the Err() accessor a caller needs to
+// build its own render states on top of listview (internal/ui/notifications'
+// error state): it must report the last HandleFetchResult error, and
+// a subsequent successful SetItems/HandleFetchResult call must clear it back
+// to nil rather than leaving the accessor permanently sticky.
+func TestErr_ReflectsHandleFetchResult(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+
+	if m.Err() != nil {
+		t.Fatalf("Err() = %v, want nil before any fetch", m.Err())
+	}
+
+	mockErr := fmt.Errorf("fetch failed")
+	m = m.HandleFetchResult(nil, mockErr)
+	if m.Err() == nil {
+		t.Fatal("Err() = nil after a failing HandleFetchResult, want the error")
+	}
+
+	m = m.SetItems([]testItem{{ID: 1, Name: "Alpha"}})
+	if m.Err() != nil {
+		t.Errorf("Err() = %v after a successful SetItems, want nil", m.Err())
+	}
+}
+
+// TestLoading_ReflectsRefreshState pins the Loading() accessor added for the
+// same reason as Err(): "r" (listview's built-in refresh key) sets loading
+// true before the spinner clears it, and a caller overriding View() needs to
+// tell that apart from a genuinely empty feed.
+func TestLoading_ReflectsRefreshState(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+
+	if m.Loading() {
+		t.Fatal("Loading() = true before any refresh, want false")
+	}
+
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if !m.Loading() {
+		t.Fatal("Loading() = false after pressing r, want true")
+	}
+
+	m = m.HandleFetchResult([]testItem{{ID: 1, Name: "Alpha"}}, nil)
+	if m.Loading() {
+		t.Error("Loading() = true after HandleFetchResult, want false")
+	}
+}
+
+func TestEnterDetailView_EmptyItems(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+
+	// With no items, enter should not navigate to detail
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.GetViewMode() != ViewList {
+		t.Error("Should stay in list mode when no items")
+	}
+}
+
+func TestMakeColumns(t *testing.T) {
+	specs := []ColumnSpec{
+		{Title: "ID", WidthPct: 30, MinWidth: 6},
+		{Title: "Name", WidthPct: 70, MinWidth: 10},
+	}
+
+	columns := makeColumns(specs, 100, 70)
+
+	if len(columns) != 2 {
+		t.Fatalf("Expected 2 columns, got %d", len(columns))
+	}
+	if columns[0].Title != "ID" {
+		t.Errorf("Expected column 0 title 'ID', got %q", columns[0].Title)
+	}
+	if columns[1].Title != "Name" {
+		t.Errorf("Expected column 1 title 'Name', got %q", columns[1].Title)
+	}
+}
+
+func TestMakeColumns_MinWidthClampDoesNotOverflow(t *testing.T) {
+	// 7 columns simulating multi-project pipelines at a narrow terminal.
+	// Several columns have MinWidth larger than their percentage-based width.
+	// The total should never exceed available space.
+	specs := []ColumnSpec{
+		{Title: "Project", WidthPct: 11, MinWidth: 10},
+		{Title: "Status", WidthPct: 9, MinWidth: 10},
+		{Title: "Pipeline", WidthPct: 11, MinWidth: 15},
+		{Title: "Branch", WidthPct: 19, MinWidth: 10},
+		{Title: "Build", WidthPct: 23, MinWidth: 8},
+		{Title: "Timestamp", WidthPct: 14, MinWidth: 16},
+		{Title: "Duration", WidthPct: 13, MinWidth: 8},
+	}
+
+	// width=94 simulates ~96 col terminal minus border.
+	// available = 94 - 7*2 = 80
+	columns := makeColumns(specs, 94, 50)
+
+	total := 0
+	for _, col := range columns {
+		total += col.Width
+	}
+	available := 94 - len(specs)*cellPadding
+
+	if total > available {
+		t.Errorf("total column widths %d exceeds available %d", total, available)
+		for _, col := range columns {
+			t.Logf("  %s: %d", col.Title, col.Width)
+		}
+	}
+}
+
+func TestMakeColumns_WideTerminalUnchanged(t *testing.T) {
+	// At a wide terminal, MinWidth should never kick in,
+	// so behavior should be identical to the old implementation.
+	specs := []ColumnSpec{
+		{Title: "ID", WidthPct: 30, MinWidth: 6},
+		{Title: "Name", WidthPct: 70, MinWidth: 10},
+	}
+
+	columns := makeColumns(specs, 200, 70)
+	available := 200 - len(specs)*cellPadding
+
+	// 30% of 196 = 58, 70% of 196 = 137 → total 195 ≤ 196
+	total := 0
+	for _, col := range columns {
+		total += col.Width
+	}
+	if total > available {
+		t.Errorf("total %d exceeds available %d", total, available)
+	}
+	// ID should get ~30% of available
+	if columns[0].Width < 50 {
+		t.Errorf("ID column too narrow: %d", columns[0].Width)
+	}
+}
+
+func TestDetailView_ReceivesSize(t *testing.T) {
+	s := styles.DefaultStyles()
+	cfg := testConfig()
+	sizeW, sizeH := 0, 0
+	cfg.EnterDetail = func(item testItem, st *styles.Styles, w, h int) (DetailView, tea.Cmd) {
+		sizeW, sizeH = w, h
+		return &testDetailView{width: w, height: h}, nil
+	}
+	m := New(cfg, s)
+	m.width = 120
+	m.height = 40
+
+	m = m.SetItems([]testItem{{ID: 1, Name: "Alpha"}})
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if sizeW != 120 || sizeH != 40 {
+		t.Errorf("Expected detail to receive size (120, 40), got (%d, %d)", sizeW, sizeH)
+	}
+}
+
+func TestView_DetailMode(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.width = 100
+	m.height = 30
+
+	m = m.SetItems([]testItem{{ID: 1, Name: "Alpha"}})
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	view := m.View()
+	if !strings.Contains(view, "detail view content") {
+		t.Errorf("Expected detail view content, got: %q", view)
+	}
+}
+
+func TestVimMotions_GotoTopAndBottom(t *testing.T) {
+	m := New(testConfig(), styles.DefaultStyles())
+	m = m.SetItems([]testItem{{ID: 1, Name: "Alpha"}, {ID: 2, Name: "Beta"}, {ID: 3, Name: "Gamma"}})
+
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	if got := m.SelectedIndex(); got != 2 {
+		t.Fatalf("G selected row %d, want 2", got)
+	}
+
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if got := m.SelectedIndex(); got != 0 {
+		t.Fatalf("gg selected row %d, want 0", got)
+	}
+}
+
+// --- Search/Filter Tests ---
+
+func TestSearch_FKeyEntersSearchMode(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.width = 100
+	m.height = 30
+
+	items := []testItem{{ID: 1, Name: "Alpha"}, {ID: 2, Name: "Beta"}}
+	m = m.SetItems(items)
+
+	if m.IsSearching() {
+		t.Fatal("Should not be searching initially")
+	}
+
+	// Press 'f' to enter search mode
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+
+	if !m.IsSearching() {
+		t.Error("Expected to be in search mode after pressing 'f'")
+	}
+}
+
+func TestSearch_EscExitsSearchMode(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.width = 100
+	m.height = 30
+
+	items := []testItem{{ID: 1, Name: "Alpha"}, {ID: 2, Name: "Beta"}}
+	m = m.SetItems(items)
+
+	// Enter search mode
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	if !m.IsSearching() {
+		t.Fatal("Should be searching after 'f'")
+	}
+
+	// Press esc to exit search
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	if m.IsSearching() {
+		t.Error("Should not be searching after esc")
+	}
+}
+
+func TestSearch_FiltersItems(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.width = 100
+	m.height = 30
+
+	items := []testItem{
+		{ID: 1, Name: "Alpha"},
+		{ID: 2, Name: "Beta"},
+		{ID: 3, Name: "Alphabet"},
+	}
+	m = m.SetItems(items)
+
+	// Enter search mode
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+
+	// Type "alph" — should match "Alpha" and "Alphabet"
+	for _, r := range "alph" {
+		m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+
+	// Table should show 2 filtered rows
+	rows := m.table.Rows()
+	if len(rows) != 2 {
+		t.Errorf("Expected 2 filtered rows, got %d", len(rows))
+	}
+}
+
+func TestSearch_EscRestoresFullList(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.width = 100
+	m.height = 30
+
+	items := []testItem{
+		{ID: 1, Name: "Alpha"},
+		{ID: 2, Name: "Beta"},
+		{ID: 3, Name: "Gamma"},
+	}
+	m = m.SetItems(items)
+
+	// Enter search, type query, then esc
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	for _, r := range "alpha" {
+		m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	// All 3 rows should be restored
+	rows := m.table.Rows()
+	if len(rows) != 3 {
+		t.Errorf("Expected 3 rows after exiting search, got %d", len(rows))
+	}
+}
+
+func TestSearch_EnterDetailUsesFilteredIndex(t *testing.T) {
+	s := styles.DefaultStyles()
+	cfg := testConfig()
+	var detailItem testItem
+	cfg.EnterDetail = func(item testItem, st *styles.Styles, w, h int) (DetailView, tea.Cmd) {
+		detailItem = item
+		return &testDetailView{width: w, height: h}, nil
+	}
+	m := New(cfg, s)
+	m.width = 100
+	m.height = 30
+
+	items := []testItem{
+		{ID: 1, Name: "Alpha"},
+		{ID: 2, Name: "Beta"},
+		{ID: 3, Name: "Gamma"},
+	}
+	m = m.SetItems(items)
+
+	// Enter search, filter to "Beta"
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	for _, r := range "beta" {
+		m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+
+	// Press enter — should open detail for "Beta" (ID=2), not "Alpha" (ID=1)
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if detailItem.ID != 2 {
+		t.Errorf("Expected detail for item ID=2 (Beta), got ID=%d (%s)", detailItem.ID, detailItem.Name)
+	}
+}
+
+func TestSearch_ViewShowsSearchBar(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.width = 100
+	m.height = 30
+
+	items := []testItem{{ID: 1, Name: "Alpha"}}
+	m = m.SetItems(items)
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	// Enter search mode
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+
+	view := m.View()
+	// Should contain the search prompt or indicator
+	if !strings.Contains(view, "/") && !strings.Contains(view, "Search") {
+		t.Errorf("Search view should contain search indicator, got: %q", view)
+	}
+}
+
+func TestSearch_SetItemsReappliesFilter(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.width = 100
+	m.height = 30
+
+	items := []testItem{
+		{ID: 1, Name: "Alpha"},
+		{ID: 2, Name: "Beta"},
+	}
+	m = m.SetItems(items)
+
+	// Enter search, type "alpha"
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	for _, r := range "alpha" {
+		m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+
+	// Now simulate a poll update with SetItems
+	newItems := []testItem{
+		{ID: 1, Name: "Alpha"},
+		{ID: 2, Name: "Beta"},
+		{ID: 4, Name: "AlphaTwo"},
+	}
+	m = m.SetItems(newItems)
+
+	// Should re-apply filter: "Alpha" and "AlphaTwo" match
+	rows := m.table.Rows()
+	if len(rows) != 2 {
+		t.Errorf("Expected 2 filtered rows after SetItems, got %d", len(rows))
+	}
+}
+
+func TestSearch_NoFilterFuncDisablesSearch(t *testing.T) {
+	s := styles.DefaultStyles()
+	cfg := testConfig()
+	cfg.FilterFunc = nil // No filter function
+	m := New(cfg, s)
+	m.width = 100
+	m.height = 30
+
+	items := []testItem{{ID: 1, Name: "Alpha"}}
+	m = m.SetItems(items)
+
+	// Press 'f' — should NOT enter search mode (no FilterFunc)
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+
+	if m.IsSearching() {
+		t.Error("Should not enter search mode when FilterFunc is nil")
+	}
+}
+
+// --- ToColumns Tests ---
+
+// testConfigWithToColumns returns a Config that adds a conditional "Extra" column
+// (and a matching cell in ToRows) when any item has ID > 100. This simulates the
+// mixed-kind glyph-column pattern: a column that appears only for certain item sets.
+func testConfigWithToColumns() Config[testItem] {
+	cfg := testConfig()
+
+	cfg.ToColumns = func(items []testItem) []ColumnSpec {
+		hasExtra := false
+		for _, it := range items {
+			if it.ID > 100 {
+				hasExtra = true
+				break
+			}
+		}
+		cols := []ColumnSpec{
+			{Title: "ID", WidthPct: 30, MinWidth: 6},
+			{Title: "Name", WidthPct: 70, MinWidth: 10},
+		}
+		if hasExtra {
+			cols = append([]ColumnSpec{{Title: "Extra", WidthPct: 10, MinWidth: 4}}, cols...)
+		}
+		NormalizeWidths(cols)
+		return cols
+	}
+
+	cfg.ToRows = func(items []testItem, s *styles.Styles) []table.Row {
+		hasExtra := false
+		for _, it := range items {
+			if it.ID > 100 {
+				hasExtra = true
+				break
+			}
+		}
+		rows := make([]table.Row, len(items))
+		for i, item := range items {
+			cells := table.Row{fmt.Sprintf("%d", item.ID), item.Name}
+			if hasExtra {
+				cells = append(table.Row{"*"}, cells...)
+			}
+			rows[i] = cells
+		}
+		return rows
+	}
+
+	return cfg
+}
+
+// TestToColumns_Nil_FallsBackToStaticColumns verifies that when ToColumns is nil
+// the model uses the static Columns slice from Config.
+func TestToColumns_Nil_FallsBackToStaticColumns(t *testing.T) {
+	s := styles.DefaultStyles()
+	cfg := testConfig() // ToColumns is nil
+	m := New(cfg, s)
+
+	items := []testItem{{ID: 1, Name: "Alpha"}}
+	m = m.SetItems(items)
+
+	gotCols := m.Table().Columns()
+	if len(gotCols) != len(cfg.Columns) {
+		t.Errorf("ToColumns=nil: got %d columns, want %d (static cfg.Columns)", len(gotCols), len(cfg.Columns))
+	}
+}
+
+// TestToColumns_UpdatesWhenSetItemsChanges verifies that columns are re-derived
+// each time SetItems is called — not cached from the first call.
+func TestToColumns_UpdatesWhenSetItemsChanges(t *testing.T) {
+	s := styles.DefaultStyles()
+	cfg := testConfigWithToColumns()
+	m := New(cfg, s)
+
+	// Start with normal items.
+	m = m.SetItems([]testItem{{ID: 1, Name: "Alpha"}})
+	if n := len(m.Table().Columns()); n != 2 {
+		t.Fatalf("Before: got %d columns, want 2", n)
+	}
+
+	// Switch to items that trigger the extra column.
+	m = m.SetItems([]testItem{{ID: 200, Name: "Beta"}})
+	if n := len(m.Table().Columns()); n != 3 {
+		t.Fatalf("After trigger: got %d columns, want 3", n)
+	}
+
+	// Switch back to normal items — extra column must disappear.
+	m = m.SetItems([]testItem{{ID: 1, Name: "Gamma"}})
+	if n := len(m.Table().Columns()); n != 2 {
+		t.Fatalf("After revert: got %d columns, want 2", n)
+	}
+}
+
+// TestView_WithToColumns_MixedItems_NoPanic constructs a listview model whose
+// ToColumns callback adds an extra column for certain items, sets those items,
+// sends a resize, then calls View(). It must not panic and columns must equal
+// cells.
+func TestView_WithToColumns_MixedItems_NoPanic(t *testing.T) {
+	s := styles.DefaultStyles()
+	cfg := testConfigWithToColumns()
+	m := New(cfg, s)
+
+	// Items that trigger the extra column (mixed set: one ID > 100, one not).
+	items := []testItem{{ID: 200, Name: "Extra"}, {ID: 1, Name: "Normal"}}
+	m = m.SetItems(items)
+
+	// Give the model proper dimensions via a WindowSizeMsg.
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	// View() must not panic.
+	view := m.View()
+	if view == "" {
+		t.Error("View() returned empty string for mixed items")
+	}
+
+	// Assert lock-step: column count == cell count in every row.
+	cols := m.Table().Columns()
+	rows := m.Table().Rows()
+	if len(rows) == 0 {
+		t.Fatal("Expected rows after SetItems, got 0")
+	}
+	if len(cols) != len(rows[0]) {
+		t.Errorf("column count %d != row cell count %d (columns and rows out of sync)", len(cols), len(rows[0]))
+	}
+}
+
+func TestSearch_MatchCountInView(t *testing.T) {
+	s := styles.DefaultStyles()
+	m := New(testConfig(), s)
+	m.width = 100
+	m.height = 30
+
+	items := []testItem{
+		{ID: 1, Name: "Alpha"},
+		{ID: 2, Name: "Beta"},
+		{ID: 3, Name: "Alphabet"},
+	}
+	m = m.SetItems(items)
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	// Enter search, type "alph"
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	for _, r := range "alph" {
+		m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+
+	view := m.View()
+	// Should show match count like "2/3"
+	if !strings.Contains(view, "2/3") {
+		t.Errorf("Search view should show match count '2/3', got: %q", view)
+	}
+}

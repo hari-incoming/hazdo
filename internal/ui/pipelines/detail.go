@@ -1,0 +1,1008 @@
+package pipelines
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/hari-incoming/hazdo/internal/browser"
+	"github.com/hari-incoming/hazdo/internal/provider"
+	"github.com/hari-incoming/hazdo/internal/ui/components"
+	"github.com/hari-incoming/hazdo/internal/ui/styles"
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// openURL is a package-level seam so tests can intercept browser launches.
+var openURL = browser.Open
+
+// openURLResultMsg is sent when an attempt to open a URL in the browser completes.
+type openURLResultMsg struct {
+	err error
+}
+
+type runParametersLoadedMsg struct {
+	parameters map[string]any
+	err        error
+}
+
+// TimelineNode represents a node in the timeline tree with its children
+type TimelineNode struct {
+	Record      provider.TimelineRecord
+	Children    []*TimelineNode
+	VisualDepth int // depth in the displayed tree (skips filtered types)
+	Expanded    bool
+}
+
+// HasChildren returns true if the node has visible (non-filtered) child nodes.
+// Looks through filtered intermediary types (Phase, Checkpoint) to find real children.
+func (n *TimelineNode) HasChildren() bool {
+	return hasVisibleChildren(n.Children)
+}
+
+// hasVisibleChildren checks if any nodes in the slice (or their filtered descendants) are visible
+func hasVisibleChildren(nodes []*TimelineNode) bool {
+	for _, child := range nodes {
+		if !isFilteredRecordType(child.Record.Type) {
+			return true
+		}
+		// Look through filtered nodes for visible grandchildren
+		if hasVisibleChildren(child.Children) {
+			return true
+		}
+	}
+	return false
+}
+
+// DetailModel represents the pipeline detail view showing timeline
+type DetailModel struct {
+	client             provider.Provider
+	run                provider.PipelineRun
+	runParameters      map[string]any
+	runParamsErr       error
+	runParamsLoad      bool
+	runParamsDone      bool
+	showRunParams      bool
+	approvals          *approvalListModel
+	approvalGeneration uint64
+	timeline           *provider.Timeline
+	tree               []*TimelineNode
+	flatItems          []*TimelineNode
+	allFlatItems       []*TimelineNode // unfiltered items, set when searching
+	selectedIndex      int
+	searching          bool
+	searchInput        textinput.Model
+	searchQuery        string
+	pendingFold        bool
+	pendingG           bool
+	loading            bool
+	err                error
+	width              int
+	height             int
+	viewport           viewport.Model
+	ready              bool
+	statusMessage      string
+	spinner            *components.LoadingIndicator
+	styles             *styles.Styles
+}
+
+// NewDetailModel creates a new detail model for a pipeline run with default styles
+func NewDetailModel(client provider.Provider, run provider.PipelineRun) *DetailModel {
+	return NewDetailModelWithStyles(client, run, styles.DefaultStyles())
+}
+
+// NewDetailModelWithStyles creates a new detail model with custom styles
+func NewDetailModelWithStyles(client provider.Provider, run provider.PipelineRun, s *styles.Styles) *DetailModel {
+	spinner := components.NewLoadingIndicator(s)
+	spinner.SetMessage(fmt.Sprintf("Loading timeline for %s #%s...", run.DefinitionName, run.BuildNumber))
+
+	ti := textinput.New()
+	ti.Prompt = "/ "
+	ti.CharLimit = 100
+
+	return &DetailModel{
+		client:        client,
+		run:           run,
+		selectedIndex: 0,
+		searchInput:   ti,
+		spinner:       spinner,
+		styles:        s,
+	}
+}
+
+// Init initializes the model and fetches timeline
+func (m *DetailModel) Init() tea.Cmd {
+	m.loading = true
+	m.spinner.SetVisible(true)
+	return tea.Batch(m.fetchTimeline(), m.spinner.Init())
+}
+
+// SetTimeline sets the timeline data (useful for testing)
+func (m *DetailModel) SetTimeline(timeline *provider.Timeline) {
+	m.timeline = timeline
+	m.tree = buildTimelineTree(timeline)
+	m.flatItems = flattenTree(m.tree)
+	m.selectedIndex = 0
+	if m.ready {
+		m.updateViewportContent()
+	}
+}
+
+// updateViewportContent updates the viewport content based on current items and selection
+func (m *DetailModel) updateViewportContent() {
+	if len(m.flatItems) == 0 {
+		return
+	}
+
+	var sb strings.Builder
+	for i, node := range m.flatItems {
+		line := m.renderRecord(node, i == m.selectedIndex)
+		sb.WriteString(line)
+		if i < len(m.flatItems)-1 {
+			sb.WriteString("\n")
+		}
+	}
+	m.viewport.SetContent(sb.String())
+}
+
+// SetSize sets the view dimensions
+func (m *DetailModel) SetSize(width, height int) {
+	m.width = width
+	m.height = height
+	if m.approvals != nil {
+		m.approvals.SetSize(width)
+		return
+	}
+
+	// Account for header lines rendered in View(): title (1) + separator (1) = 2
+	headerLines := 2
+	viewportHeight := height - headerLines
+	if viewportHeight < 1 {
+		viewportHeight = 1
+	}
+
+	if !m.ready {
+		m.viewport = viewport.New(width, viewportHeight)
+		m.ready = true
+	} else {
+		m.viewport.Width = width
+		m.viewport.Height = viewportHeight
+	}
+
+	// Update viewport content if we have items
+	if len(m.flatItems) > 0 {
+		m.updateViewportContent()
+	}
+}
+
+// Update handles messages
+func (m *DetailModel) Update(msg tea.Msg) (*DetailModel, tea.Cmd) {
+	if m.approvals != nil {
+		if key, ok := msg.(tea.KeyMsg); ok && key.String() == "esc" {
+			m.approvals = nil
+			return m, nil
+		}
+		switch msg.(type) {
+		case tea.KeyMsg, pipelineApprovalsLoadedMsg, pipelineApprovalUpdatedMsg:
+			var cmd tea.Cmd
+			m.approvals, cmd = m.approvals.Update(msg)
+			return m, cmd
+		case tea.WindowSizeMsg:
+			m.approvals, _ = m.approvals.Update(msg)
+		}
+	}
+
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+
+	case spinner.TickMsg:
+		// Forward spinner tick messages
+		if m.loading {
+			var spinnerCmd tea.Cmd
+			m.spinner, spinnerCmd = m.spinner.Update(msg)
+			return m, spinnerCmd
+		}
+
+	case tea.KeyMsg:
+		if m.searching {
+			return m.updateSearch(msg)
+		}
+
+		if m.pendingFold {
+			m.pendingFold = false
+			switch msg.String() {
+			case "M":
+				m.CollapseAll()
+				return m, nil
+			case "R":
+				m.ExpandAll()
+				return m, nil
+			case "P", "p", "shift+p":
+				return m, m.toggleRunParameters()
+			}
+		}
+
+		if m.showRunParams && msg.String() == "esc" {
+			m.showRunParams = false
+			return m, nil
+		}
+		if m.showRunParams && msg.String() != "z" {
+			return m, nil
+		}
+
+		if msg.String() != "g" {
+			m.pendingG = false
+		}
+
+		switch msg.String() {
+		case "up", "k":
+			m.MoveUp()
+		case "down", "j":
+			m.MoveDown()
+		case "g":
+			if m.pendingG {
+				m.selectedIndex = 0
+				m.pendingG = false
+				m.updateViewportContent()
+				m.ensureSelectedVisible()
+			} else {
+				m.pendingG = true
+			}
+		case "G":
+			if len(m.flatItems) > 0 {
+				m.selectedIndex = len(m.flatItems) - 1
+				m.updateViewportContent()
+				m.ensureSelectedVisible()
+			}
+		case "z":
+			m.pendingFold = true
+			if m.run.Identity.Kind == provider.KindAzure {
+				m.statusMessage = "Press P (or p) to view this run's parameters"
+			}
+		case "pgup":
+			m.PageUp()
+		case "pgdown":
+			m.PageDown()
+		case "f":
+			if len(m.flatItems) > 0 {
+				m.EnterSearch()
+				return m, m.searchInput.Focus()
+			}
+		case "/":
+			if len(m.flatItems) > 0 {
+				m.EnterSearch()
+				return m, m.searchInput.Focus()
+			}
+		case "r":
+			m.loading = true
+			m.spinner.SetVisible(true)
+			return m, tea.Batch(m.fetchTimeline(), m.spinner.Tick())
+		case "o":
+			return m, m.openInBrowser()
+		case "p":
+			return m, m.openPendingApprovals()
+		}
+
+	case timelineMsg:
+		m.loading = false
+		m.spinner.SetVisible(false)
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		m.SetTimeline(msg.timeline)
+
+	case runParametersLoadedMsg:
+		m.runParamsLoad = false
+		m.runParamsErr = msg.err
+		if msg.err == nil {
+			m.runParameters = msg.parameters
+			m.runParamsDone = true
+		}
+		m.statusMessage = ""
+
+	case openURLResultMsg:
+		if msg.err != nil {
+			m.statusMessage = fmt.Sprintf("Failed to open browser: %v", msg.err)
+		} else {
+			m.statusMessage = "Opened in browser"
+		}
+		return m, nil
+	}
+
+	return m, nil
+}
+
+// View renders the detail view
+func (m *DetailModel) View() string {
+	// Helper to wrap content with consistent width
+	wrapContent := func(content string) string {
+		contentStyle := lipgloss.NewStyle().
+			Width(m.width)
+		return contentStyle.Render(content)
+	}
+
+	if m.showRunParams {
+		return wrapContent(m.viewRunParameters())
+	}
+	if m.approvals != nil {
+		return wrapContent(m.approvals.View())
+	}
+
+	if m.err != nil {
+		return wrapContent(fmt.Sprintf("Error loading timeline: %v\n\nPress r to retry, Esc to go back", m.err))
+	}
+
+	if m.loading {
+		return wrapContent(m.spinner.View())
+	}
+
+	if m.timeline == nil || len(m.flatItems) == 0 {
+		return wrapContent("No timeline data available.\n\nPress r to refresh, Esc to go back")
+	}
+
+	var sb strings.Builder
+
+	// Header
+	sb.WriteString(m.styles.Header.Render(fmt.Sprintf("%s #%s", m.run.DefinitionName, m.run.BuildNumber)))
+	sb.WriteString("\n")
+	sb.WriteString(strings.Repeat("─", min(m.width-2, 60)))
+	sb.WriteString("\n")
+
+	// Viewport with timeline records
+	if m.ready {
+		sb.WriteString(m.viewport.View())
+	}
+
+	if m.searching {
+		total := 0
+		if m.allFlatItems != nil {
+			total = len(m.allFlatItems)
+		}
+		matched := len(m.flatItems)
+		sb.WriteString("\n")
+		sb.WriteString(fmt.Sprintf("%s %d/%d", m.searchInput.View(), matched, total))
+	}
+
+	return wrapContent(sb.String())
+}
+
+// renderRecord renders a single timeline record
+func (m *DetailModel) renderRecord(node *TimelineNode, selected bool) string {
+	indent := strings.Repeat("  ", node.VisualDepth)
+	icon := recordIconWithStyles(node.Record.State, node.Record.Result, m.styles)
+	duration := formatRecordDuration(node.Record.StartTime, node.Record.FinishTime)
+
+	// Expand/collapse indicator for nodes with children
+	expandIndicator := " "
+	if node.HasChildren() {
+		if node.Expanded {
+			expandIndicator = "▼"
+		} else {
+			expandIndicator = "▶"
+		}
+	}
+
+	// Format: [indent][icon] [expand] [name] [duration]
+	line := fmt.Sprintf("%s%s %s %s", indent, icon, expandIndicator, node.Record.Name)
+
+	if duration != "-" {
+		line = fmt.Sprintf("%s (%s)", line, duration)
+	}
+
+	// Add log indicator if available
+	if node.Record.LogID != 0 {
+		line = fmt.Sprintf("%s 📄", line)
+	}
+
+	if selected {
+		return m.styles.Selected.Render(line)
+	}
+
+	return line
+}
+
+// SelectedIndex returns the current selection index
+func (m *DetailModel) SelectedIndex() int {
+	return m.selectedIndex
+}
+
+// SelectedItem returns the currently selected timeline node
+func (m *DetailModel) SelectedItem() *TimelineNode {
+	if len(m.flatItems) == 0 || m.selectedIndex >= len(m.flatItems) {
+		return nil
+	}
+	return m.flatItems[m.selectedIndex]
+}
+
+// MoveUp moves selection up
+func (m *DetailModel) MoveUp() {
+	if m.selectedIndex > 0 {
+		m.statusMessage = ""
+		m.selectedIndex--
+		m.updateViewportContent()
+		m.ensureSelectedVisible()
+	}
+}
+
+// MoveDown moves selection down
+func (m *DetailModel) MoveDown() {
+	if m.selectedIndex < len(m.flatItems)-1 {
+		m.statusMessage = ""
+		m.selectedIndex++
+		m.updateViewportContent()
+		m.ensureSelectedVisible()
+	}
+}
+
+// ToggleExpand toggles the expanded state of the selected node
+func (m *DetailModel) ToggleExpand() {
+	selected := m.SelectedItem()
+	if selected == nil || !selected.HasChildren() {
+		return
+	}
+
+	selected.Expanded = !selected.Expanded
+
+	// When expanding, also expand any filtered intermediary children
+	// so visible descendants are reachable
+	if selected.Expanded {
+		expandFilteredChildren(selected.Children)
+	}
+
+	m.flatItems = flattenTree(m.tree)
+
+	// Clamp selection if it's out of bounds after collapse
+	if m.selectedIndex >= len(m.flatItems) {
+		m.selectedIndex = len(m.flatItems) - 1
+	}
+
+	if m.ready {
+		m.updateViewportContent()
+		m.ensureSelectedVisible()
+	}
+}
+
+// CollapseAll closes every expandable pipeline timeline record.
+func (m *DetailModel) CollapseAll() {
+	setTimelineExpanded(m.tree, false)
+	m.flatItems = flattenTree(m.tree)
+	m.selectedIndex = 0
+	if m.ready {
+		m.updateViewportContent()
+		m.ensureSelectedVisible()
+	}
+}
+
+// ExpandAll opens every pipeline timeline record.
+func (m *DetailModel) ExpandAll() {
+	setTimelineExpanded(m.tree, true)
+	m.flatItems = flattenTree(m.tree)
+	m.selectedIndex = 0
+	if m.ready {
+		m.updateViewportContent()
+		m.ensureSelectedVisible()
+	}
+}
+
+func setTimelineExpanded(nodes []*TimelineNode, expanded bool) {
+	for _, node := range nodes {
+		node.Expanded = expanded
+		setTimelineExpanded(node.Children, expanded)
+	}
+}
+
+// expandFilteredChildren auto-expands filtered intermediary nodes so their
+// visible children become reachable when the parent is expanded
+func expandFilteredChildren(nodes []*TimelineNode) {
+	for _, node := range nodes {
+		if isFilteredRecordType(node.Record.Type) {
+			node.Expanded = true
+			expandFilteredChildren(node.Children)
+		}
+	}
+}
+
+// PageUp moves selection up by one page (viewport height)
+func (m *DetailModel) PageUp() {
+	if !m.ready || len(m.flatItems) == 0 {
+		return
+	}
+	pageSize := m.viewport.Height
+	if pageSize < 1 {
+		pageSize = 1
+	}
+	m.selectedIndex -= pageSize
+	if m.selectedIndex < 0 {
+		m.selectedIndex = 0
+	}
+	m.updateViewportContent()
+	m.ensureSelectedVisible()
+}
+
+// PageDown moves selection down by one page (viewport height)
+func (m *DetailModel) PageDown() {
+	if !m.ready || len(m.flatItems) == 0 {
+		return
+	}
+	pageSize := m.viewport.Height
+	if pageSize < 1 {
+		pageSize = 1
+	}
+	m.selectedIndex += pageSize
+	if m.selectedIndex >= len(m.flatItems) {
+		m.selectedIndex = len(m.flatItems) - 1
+	}
+	m.updateViewportContent()
+	m.ensureSelectedVisible()
+}
+
+// ensureSelectedVisible scrolls the viewport to keep the selected item visible
+func (m *DetailModel) ensureSelectedVisible() {
+	if !m.ready || len(m.flatItems) == 0 {
+		return
+	}
+
+	// Each item is one line, so line number = selectedIndex
+	visibleStart := m.viewport.YOffset
+	visibleEnd := visibleStart + m.viewport.Height - 1
+
+	if m.selectedIndex < visibleStart {
+		m.viewport.SetYOffset(m.selectedIndex)
+	} else if m.selectedIndex > visibleEnd {
+		m.viewport.SetYOffset(m.selectedIndex - m.viewport.Height + 1)
+	}
+}
+
+// CanViewLogs returns true if the selected item has logs that can be viewed
+func (m *DetailModel) CanViewLogs() bool {
+	selected := m.SelectedItem()
+	return selected != nil && selected.Record.LogID != 0
+}
+
+// GetStatusMessage returns a status message based on the selected item.
+// A transient browser-open result takes precedence; it is cleared the next time
+// the selection moves so the per-record log hint resumes.
+func (m *DetailModel) GetStatusMessage() string {
+	if m.approvals != nil {
+		return m.approvals.status
+	}
+	if m.statusMessage != "" {
+		return m.statusMessage
+	}
+	selected := m.SelectedItem()
+	if selected == nil {
+		return ""
+	}
+
+	if selected.Record.LogID == 0 {
+		return fmt.Sprintf("%s has no logs", selected.Record.Type)
+	}
+	return ""
+}
+
+// GetRun returns the pipeline run
+func (m *DetailModel) GetRun() provider.PipelineRun {
+	return m.run
+}
+
+// openInBrowser returns a command that opens the pipeline-run URL in the user's
+// default browser. It prefers the WebURL carried on the run (populated by both
+// the Azure and GitHub mappers) and falls back to the provider's PipelineURL
+// builder. If no URL can be produced it sets a status message and returns nil.
+func (m *DetailModel) openInBrowser() tea.Cmd {
+	url := m.run.WebURL
+	if url == "" && m.client != nil {
+		url = m.client.PipelineURL(m.run.Identity.Scope, parseBuildID(m.run.Identity.ID))
+	}
+	if url == "" {
+		m.statusMessage = "Cannot open: no pipeline URL available"
+		return nil
+	}
+	return func() tea.Msg {
+		return openURLResultMsg{err: openURL(url)}
+	}
+}
+
+// GetContextItems returns context bar items for this view
+func (m *DetailModel) GetContextItems() []components.ContextItem {
+	if m.approvals != nil {
+		return m.approvals.GetContextItems()
+	}
+	items := []components.ContextItem{
+		{Key: "j/k, gg/G", Description: "navigate"},
+		{Key: "f or /", Description: "search timeline"},
+		{Key: "enter", Description: "expand/collapse or view logs"},
+		{Key: "zM/zR", Description: "collapse/expand all"},
+		{Key: "o", Description: "open in browser"},
+	}
+	if m.run.Identity.Kind == provider.KindAzure {
+		items = append(items, components.ContextItem{Key: "n", Description: "run new"})
+		items = append(items, components.ContextItem{Key: "zP", Description: "view run parameters"})
+		if m.canApprovePipelineResources() {
+			items = append(items, components.ContextItem{Key: "p", Description: "pending resource approvals"})
+		}
+	}
+	return items
+}
+
+func (m *DetailModel) canApprovePipelineResources() bool {
+	if m.client == nil || m.run.Identity.Kind != provider.KindAzure {
+		return false
+	}
+	if capability, ok := m.client.(provider.PipelineApprovalCapability); ok && !capability.HasPipelineApprovals() {
+		return false
+	}
+	_, ok := m.client.(provider.PipelineApprovalSource)
+	return ok
+}
+
+func (m *DetailModel) openPendingApprovals() tea.Cmd {
+	if !m.canApprovePipelineResources() {
+		m.statusMessage = "Pipeline resource approvals are unavailable for this provider"
+		return nil
+	}
+	source := m.client.(provider.PipelineApprovalSource)
+	m.approvalGeneration++
+	m.approvals = newApprovalListModel(source, m.run.Identity.Scope, m.width, m.approvalGeneration, m.styles)
+	return m.approvals.Init()
+}
+
+func (m *DetailModel) toggleRunParameters() tea.Cmd {
+	if m.run.Identity.Kind != provider.KindAzure {
+		return nil
+	}
+	if m.showRunParams && m.runParamsErr == nil {
+		m.showRunParams = false
+		return nil
+	}
+	m.showRunParams = true
+	if m.runParamsDone || m.runParamsLoad {
+		return nil
+	}
+	m.runParamsLoad = true
+	m.runParamsErr = nil
+	source, ok := m.client.(provider.PipelineRunParameterSource)
+	run := m.run
+	return func() tea.Msg {
+		if !ok {
+			return runParametersLoadedMsg{err: fmt.Errorf("pipeline run parameters are unavailable for this provider")}
+		}
+		runID := parseBuildID(run.Identity.ID)
+		if run.DefinitionID <= 0 || runID <= 0 {
+			return runParametersLoadedMsg{err: fmt.Errorf("pipeline or run ID is unavailable")}
+		}
+		parameters, err := source.GetPipelineRunParameters(run.Identity.Scope, run.DefinitionID, runID)
+		return runParametersLoadedMsg{parameters: parameters, err: err}
+	}
+}
+
+func (m *DetailModel) viewRunParameters() string {
+	var sb strings.Builder
+	sb.WriteString(m.styles.Header.Render(fmt.Sprintf("Runtime Parameters: %s #%s", m.run.DefinitionName, m.run.BuildNumber)))
+	sb.WriteString("\n")
+	sb.WriteString(strings.Repeat("─", min(m.width-2, 60)))
+	sb.WriteString("\n\n")
+	switch {
+	case m.runParamsLoad:
+		sb.WriteString("Loading runtime parameters...")
+	case m.runParamsErr != nil:
+		sb.WriteString(fmt.Sprintf("Could not load runtime parameters: %v\nPress zP to retry, Esc to return", m.runParamsErr))
+	case len(m.runParameters) == 0:
+		sb.WriteString("No runtime parameters were captured for this run.")
+	default:
+		names := make([]string, 0, len(m.runParameters))
+		for name := range m.runParameters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for i, name := range names {
+			sb.WriteString(fmt.Sprintf("%s: %s", name, parameterText(m.runParameters[name], "string")))
+			if i < len(names)-1 {
+				sb.WriteString("\n")
+			}
+		}
+	}
+	sb.WriteString("\n\nEsc: return to timeline")
+	return sb.String()
+}
+
+// GetScrollPercent returns the current scroll percentage (0-100)
+// Based on selection position relative to total items
+func (m *DetailModel) GetScrollPercent() float64 {
+	if m.approvals != nil {
+		return 0
+	}
+	if !m.ready || len(m.flatItems) <= 1 {
+		return 0
+	}
+	return float64(m.selectedIndex) / float64(len(m.flatItems)-1) * 100
+}
+
+func (m *DetailModel) updateSearch(msg tea.KeyMsg) (*DetailModel, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.ExitSearch()
+		return m, nil
+	case "enter":
+		// Don't pass enter to text input; let parent handle expand/collapse
+		return m, nil
+	case "up", "k":
+		m.MoveUp()
+		return m, nil
+	case "down", "j":
+		m.MoveDown()
+		return m, nil
+	case "pgup":
+		m.PageUp()
+		return m, nil
+	case "pgdown":
+		m.PageDown()
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.searchInput, cmd = m.searchInput.Update(msg)
+
+	newQuery := m.searchInput.Value()
+	if newQuery != m.searchQuery {
+		m.searchQuery = newQuery
+		m.applySearchFilter()
+	}
+
+	return m, cmd
+}
+
+// IsSearching returns whether the detail view is in search mode.
+func (m *DetailModel) IsSearching() bool {
+	return m.searching || m.approvals != nil
+}
+
+// EnterSearch enters search mode.
+func (m *DetailModel) EnterSearch() {
+	m.searching = true
+	m.searchInput.SetValue("")
+	m.searchQuery = ""
+	// Store all tree nodes (regardless of expand state) for total count display
+	m.allFlatItems = allTreeNodes(m.tree)
+	m.searchInput.Focus()
+}
+
+// ExitSearch exits search mode and restores all items from the tree.
+func (m *DetailModel) ExitSearch() {
+	m.searching = false
+	m.searchQuery = ""
+	m.searchInput.Blur()
+	// Restore from tree (respects current expand/collapse state)
+	m.flatItems = flattenTree(m.tree)
+	m.allFlatItems = nil
+	m.selectedIndex = 0
+	if m.ready {
+		m.updateViewportContent()
+	}
+}
+
+// SetSearchQuery sets the search query and filters items.
+func (m *DetailModel) SetSearchQuery(query string) {
+	m.searchQuery = query
+	m.searchInput.SetValue(query)
+	m.applySearchFilter()
+}
+
+// searchBarHeight is the vertical space consumed by the search bar.
+const detailSearchBarHeight = 1
+
+// allTreeNodes returns every node in the tree regardless of expand/collapse state,
+// skipping filtered intermediary types (Phase, Checkpoint).
+func allTreeNodes(roots []*TimelineNode) []*TimelineNode {
+	var result []*TimelineNode
+	var walk func(nodes []*TimelineNode, depth int)
+	walk = func(nodes []*TimelineNode, depth int) {
+		for _, node := range nodes {
+			if isFilteredRecordType(node.Record.Type) {
+				walk(node.Children, depth)
+				continue
+			}
+			node.VisualDepth = depth
+			result = append(result, node)
+			walk(node.Children, depth+1)
+		}
+	}
+	walk(roots, 0)
+	return result
+}
+
+func (m *DetailModel) applySearchFilter() {
+	if m.searchQuery == "" {
+		// Restore from tree (respects expand/collapse state)
+		m.flatItems = flattenTree(m.tree)
+	} else {
+		// Search ALL nodes in the tree, not just currently visible ones
+		all := allTreeNodes(m.tree)
+		q := strings.ToLower(m.searchQuery)
+		filtered := make([]*TimelineNode, 0, len(all))
+		for _, node := range all {
+			if strings.Contains(strings.ToLower(node.Record.Name), q) {
+				filtered = append(filtered, node)
+			}
+		}
+		m.flatItems = filtered
+	}
+
+	m.selectedIndex = 0
+	if m.ready {
+		m.updateViewportContent()
+	}
+}
+
+// Messages
+
+type timelineMsg struct {
+	timeline *provider.Timeline
+	err      error
+}
+
+func (m *DetailModel) fetchTimeline() tea.Cmd {
+	return func() tea.Msg {
+		if m.client == nil {
+			return timelineMsg{timeline: nil, err: nil}
+		}
+		timeline, err := m.client.GetBuildTimeline(m.run.Identity.Scope, parseBuildID(m.run.Identity.ID))
+		return timelineMsg{timeline: timeline, err: err}
+	}
+}
+
+// Helper functions
+
+// recordIconWithStyles returns an icon based on state and result using provided styles
+func recordIconWithStyles(state, result string, s *styles.Styles) string {
+	stateLower := strings.ToLower(state)
+	resultLower := strings.ToLower(result)
+
+	switch {
+	case stateLower == "inprogress":
+		return s.Info.Render("●")
+	case stateLower == "pending":
+		return s.Muted.Render("○")
+	case resultLower == "succeeded":
+		return s.Success.Render("✓")
+	case resultLower == "succeededwithissues":
+		return s.Warning.Render("◐")
+	case resultLower == "failed":
+		return s.Error.Render("✗")
+	case resultLower == "canceled", resultLower == "skipped", resultLower == "abandoned":
+		return s.Muted.Render("○")
+	default:
+		return s.Muted.Render("○")
+	}
+}
+
+// formatRecordDuration formats the duration of a timeline record
+func formatRecordDuration(startTime, finishTime *time.Time) string {
+	if startTime == nil {
+		return "-"
+	}
+	if finishTime == nil {
+		return "-"
+	}
+
+	duration := finishTime.Sub(*startTime)
+	return formatDuration(duration)
+}
+
+// formatDuration formats a duration in a human-readable way
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		mins := int(d.Minutes())
+		secs := int(d.Seconds()) % 60
+		return fmt.Sprintf("%dm%ds", mins, secs)
+	}
+	hours := int(d.Hours())
+	mins := int(d.Minutes()) % 60
+	secs := int(d.Seconds()) % 60
+	return fmt.Sprintf("%dh%dm%ds", hours, mins, secs)
+}
+
+// isFilteredRecordType returns true for record types that are intermediary
+// Azure DevOps nodes (Phase, Checkpoint) which should be hidden in the UI.
+// These nodes are kept in the tree for structure but skipped during display.
+func isFilteredRecordType(recordType string) bool {
+	return recordType == "Phase" || recordType == "Checkpoint"
+}
+
+// buildTimelineTree builds a tree structure from flat timeline records
+func buildTimelineTree(timeline *provider.Timeline) []*TimelineNode {
+	if timeline == nil || len(timeline.Records) == 0 {
+		return nil
+	}
+
+	// Create a map of all nodes by ID
+	nodeMap := make(map[string]*TimelineNode)
+	for i := range timeline.Records {
+		record := timeline.Records[i]
+		nodeMap[record.ID] = &TimelineNode{
+			Record:   record,
+			Children: []*TimelineNode{},
+		}
+	}
+
+	// Build the tree by linking parents and children
+	var roots []*TimelineNode
+	for _, node := range nodeMap {
+		if node.Record.ParentID == "" {
+			roots = append(roots, node)
+		} else {
+			parentNode, ok := nodeMap[node.Record.ParentID]
+			if ok {
+				parentNode.Children = append(parentNode.Children, node)
+			} else {
+				// Orphan node, treat as root
+				roots = append(roots, node)
+			}
+		}
+	}
+
+	// Sort roots and children by Order
+	sortNodes(roots)
+	for _, root := range roots {
+		sortNodesRecursive(root)
+	}
+
+	return roots
+}
+
+// sortNodes sorts a slice of nodes by Order
+func sortNodes(nodes []*TimelineNode) {
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].Record.Order < nodes[j].Record.Order
+	})
+}
+
+// sortNodesRecursive sorts children of a node recursively
+func sortNodesRecursive(node *TimelineNode) {
+	sortNodes(node.Children)
+	for _, child := range node.Children {
+		sortNodesRecursive(child)
+	}
+}
+
+// flattenTree converts a tree to a flat list (depth-first), skipping filtered types
+func flattenTree(roots []*TimelineNode) []*TimelineNode {
+	var result []*TimelineNode
+	for _, root := range roots {
+		result = append(result, flattenNodeAtDepth(root, 0)...)
+	}
+	return result
+}
+
+// flattenNodeAtDepth flattens a node and its visible children, tracking visual depth.
+// Filtered types (Phase, Checkpoint) are skipped but their children are included
+// at the same visual depth (as if they were direct children of the grandparent).
+func flattenNodeAtDepth(node *TimelineNode, visualDepth int) []*TimelineNode {
+	// Skip filtered types — always recurse into their children at same depth
+	if isFilteredRecordType(node.Record.Type) {
+		var result []*TimelineNode
+		for _, child := range node.Children {
+			result = append(result, flattenNodeAtDepth(child, visualDepth)...)
+		}
+		return result
+	}
+
+	node.VisualDepth = visualDepth
+	result := []*TimelineNode{node}
+	if node.Expanded {
+		for _, child := range node.Children {
+			result = append(result, flattenNodeAtDepth(child, visualDepth+1)...)
+		}
+	}
+	return result
+}

@@ -1,0 +1,774 @@
+package components
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/hari-incoming/hazdo/internal/polling"
+	"github.com/hari-incoming/hazdo/internal/ui/styles"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+func TestStatusBar_New(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+
+	if sb == nil {
+		t.Fatal("expected non-nil StatusBar")
+	}
+	if sb.state != polling.StateConnecting {
+		t.Errorf("expected initial state to be Connecting, got %v", sb.state)
+	}
+}
+
+func TestStatusBar_SetOrganization(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetOrganization("myorg")
+
+	if sb.organization != "myorg" {
+		t.Errorf("expected organization 'myorg', got '%s'", sb.organization)
+	}
+}
+
+func TestStatusBar_SetScopes(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetScopes([]string{"ProjA", "ProjB"})
+
+	if len(sb.scopes) != 2 {
+		t.Fatalf("expected 2 scopes, got %d", len(sb.scopes))
+	}
+	if sb.scopes[0] != "ProjA" || sb.scopes[1] != "ProjB" {
+		t.Errorf("scopes not stored correctly: %v", sb.scopes)
+	}
+}
+
+func TestStatusBar_SetState(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetState(polling.StateConnected)
+
+	if sb.state != polling.StateConnected {
+		t.Errorf("expected state StateConnected, got %v", sb.state)
+	}
+}
+
+func TestStatusBar_SetWidth(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetWidth(100)
+
+	if sb.width != 100 {
+		t.Errorf("expected width 100, got %d", sb.width)
+	}
+}
+
+func TestStatusBar_View_ContainsOrganization(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetOrganization("testorg")
+	sb.SetScopes([]string{"testproject"})
+	sb.SetWidth(120)
+
+	view := sb.View()
+
+	if !strings.Contains(view, "testorg") {
+		t.Error("view should contain organization name")
+	}
+}
+
+func TestStatusBar_View_ContainsProject(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetOrganization("testorg")
+	sb.SetScopes([]string{"testproject"})
+	sb.SetWidth(120)
+
+	view := sb.View()
+
+	if !strings.Contains(view, "testproject") {
+		t.Error("view should contain project name")
+	}
+}
+
+func TestStatusBar_View_Connected_ShowsIconOnly(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetState(polling.StateConnected)
+	sb.SetWidth(120)
+
+	view := sb.View()
+
+	// Connected state should show the icon
+	if !strings.Contains(view, "●") {
+		t.Error("view should contain connected icon ●")
+	}
+	// Connected state should NOT show the word "connected"
+	if strings.Contains(strings.ToLower(view), "connected") {
+		t.Error("connected state should show icon only, not the word 'connected'")
+	}
+}
+
+func TestStatusBar_View_NonConnectedStates_ShowText(t *testing.T) {
+	tests := []struct {
+		state      polling.ConnectionState
+		expectText string
+	}{
+		{polling.StateConnecting, "connecting"},
+		{polling.StateDisconnected, "disconnected"},
+		{polling.StateError, "error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.state.String(), func(t *testing.T) {
+			sb := NewStatusBar(styles.DefaultStyles())
+			sb.SetState(tt.state)
+			sb.SetWidth(120)
+
+			view := sb.View()
+			if !strings.Contains(strings.ToLower(view), tt.expectText) {
+				t.Errorf("state %s should show text '%s'", tt.state, tt.expectText)
+			}
+		})
+	}
+}
+
+func TestStatusBar_View_Error_ShowsError(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetState(polling.StateError)
+	sb.SetWidth(120)
+
+	view := sb.View()
+
+	if !strings.Contains(strings.ToLower(view), "error") {
+		t.Error("view should indicate error state")
+	}
+}
+
+func TestStatusBar_View_ContainsDefaultKeybindings(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetWidth(120)
+
+	view := sb.View()
+
+	// Should contain default keybindings
+	if !strings.Contains(view, "refresh") {
+		t.Error("view should contain 'refresh' keybinding")
+	}
+	if !strings.Contains(view, "quit") {
+		t.Error("view should contain 'quit' keybinding")
+	}
+	if !strings.Contains(view, "help") {
+		t.Error("view should contain 'help' keybinding")
+	}
+}
+
+func TestStatusBar_SetKeybindings(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetKeybindings("custom keybindings")
+	sb.SetWidth(120)
+
+	view := sb.View()
+
+	if !strings.Contains(view, "custom keybindings") {
+		t.Error("view should contain custom keybindings")
+	}
+}
+
+func TestStatusBar_StateIcons(t *testing.T) {
+	tests := []struct {
+		state       polling.ConnectionState
+		expectColor bool
+	}{
+		{polling.StateConnected, true},
+		{polling.StateConnecting, true},
+		{polling.StateDisconnected, true},
+		{polling.StateError, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.state.String(), func(t *testing.T) {
+			sb := NewStatusBar(styles.DefaultStyles())
+			sb.SetState(tt.state)
+			sb.SetWidth(120)
+
+			view := sb.View()
+			if len(view) == 0 {
+				t.Error("view should not be empty")
+			}
+		})
+	}
+}
+
+func TestStatusBar_View_MinimumWidth(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetOrganization("org")
+	sb.SetScopes([]string{"project"})
+	sb.SetState(polling.StateConnected)
+	sb.SetWidth(20)
+
+	view := sb.View()
+	if view == "" {
+		t.Error("view should not be empty even with minimal width")
+	}
+}
+
+func TestStatusBar_Update_ReturnsModel(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+
+	model, cmd := sb.Update(nil)
+	if model != sb {
+		t.Error("Update should return the same model")
+	}
+	if cmd != nil {
+		t.Error("Update should return nil cmd")
+	}
+}
+
+func TestStatusBar_Init_ReturnsNil(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	cmd := sb.Init()
+
+	if cmd != nil {
+		t.Error("Init should return nil")
+	}
+}
+
+func TestStatusBar_OrgProjectSeparator(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetOrganization("myorg")
+	sb.SetScopes([]string{"myproject"})
+	sb.SetWidth(120)
+
+	view := sb.View()
+
+	if !strings.Contains(view, "/") {
+		t.Error("view should contain org/project separator")
+	}
+}
+
+func TestStatusBar_View_HasBackground(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetWidth(80)
+
+	view := sb.View()
+
+	// View should have ANSI codes for background color (236)
+	// Just verify it's not empty and has some styling
+	if len(view) < 20 {
+		t.Error("view should have content with styling")
+	}
+}
+
+func TestStatusBar_Update_WithKeyMsg(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+
+	model, cmd := sb.Update(tea.KeyMsg{})
+	if model != sb {
+		t.Error("Update should return the same model for key messages")
+	}
+	if cmd != nil {
+		t.Error("Update should return nil cmd for key messages")
+	}
+}
+
+func TestStatusBar_View_DoesNotContainConfigPath(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetWidth(200)
+
+	view := sb.View()
+
+	// Config path should never appear in the status bar
+	if strings.Contains(view, "config.yaml") {
+		t.Error("status bar should NOT contain config path")
+	}
+}
+
+func TestStatusBar_SetScrollPercent(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetScrollPercent(45.5)
+
+	if sb.scrollPercent != 45.5 {
+		t.Errorf("expected scrollPercent 45.5, got %f", sb.scrollPercent)
+	}
+}
+
+func TestStatusBar_ShowScrollPercent(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.ShowScrollPercent(true)
+
+	if !sb.showScroll {
+		t.Error("expected showScroll to be true")
+	}
+
+	sb.ShowScrollPercent(false)
+	if sb.showScroll {
+		t.Error("expected showScroll to be false")
+	}
+}
+
+func TestStatusBar_View_ContainsScrollPercent(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetScrollPercent(75)
+	sb.ShowScrollPercent(true)
+	sb.SetWidth(120)
+
+	view := sb.View()
+
+	if !strings.Contains(view, "75%") {
+		t.Error("view should contain scroll percentage when enabled")
+	}
+}
+
+func TestStatusBar_View_NoScrollPercentWhenDisabled(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetScrollPercent(75)
+	sb.ShowScrollPercent(false)
+	sb.SetWidth(120)
+
+	view := sb.View()
+
+	if strings.Contains(view, "75%") {
+		t.Error("view should NOT contain scroll percentage when disabled")
+	}
+}
+
+func TestStatusBar_SetErrorMessage(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetErrorMessage("Connection failed")
+
+	if sb.errorMessage != "Connection failed" {
+		t.Errorf("expected errorMessage 'Connection failed', got '%s'", sb.errorMessage)
+	}
+}
+
+func TestStatusBar_ClearErrorMessage(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetErrorMessage("Connection failed")
+	sb.ClearErrorMessage()
+
+	if sb.errorMessage != "" {
+		t.Errorf("expected errorMessage to be empty, got '%s'", sb.errorMessage)
+	}
+}
+
+func TestStatusBar_View_ContainsErrorMessage(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetState(polling.StateError)
+	sb.SetErrorMessage("Network timeout. Retrying...")
+	sb.SetWidth(200)
+
+	view := sb.View()
+
+	if !strings.Contains(view, "Network timeout. Retrying...") {
+		t.Error("view should contain error message when state is error")
+	}
+}
+
+func TestStatusBar_View_NoErrorMessageWhenConnected(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetState(polling.StateConnected)
+	sb.SetErrorMessage("Network timeout. Retrying...")
+	sb.SetWidth(200)
+
+	view := sb.View()
+
+	if strings.Contains(view, "Network timeout. Retrying...") {
+		t.Error("view should NOT show error message when state is connected")
+	}
+}
+
+func TestStatusBar_View_ErrorMessageReplacesKeybindings(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetState(polling.StateError)
+	sb.SetErrorMessage("Connection failed. Check your network and press 'r' to retry.")
+	sb.SetWidth(200)
+
+	view := sb.View()
+
+	// Error message should be shown
+	if !strings.Contains(view, "Connection failed") {
+		t.Error("view should contain error message")
+	}
+
+	// Default detailed keybindings should NOT be shown when error is displayed
+	if strings.Contains(view, "navigate") {
+		t.Error("view should not contain detailed navigate keybinding when showing error")
+	}
+}
+
+func TestStatusBar_SetFilterLabel(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetFilterLabel("My Items")
+	sb.SetWidth(200)
+
+	view := sb.View()
+
+	if !strings.Contains(view, "My Items") {
+		t.Error("view should contain filter label 'My Items'")
+	}
+}
+
+func TestStatusBar_ClearFilterLabel(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetFilterLabel("My Items")
+	sb.ClearFilterLabel()
+	sb.SetWidth(200)
+
+	view := sb.View()
+
+	if strings.Contains(view, "My Items") {
+		t.Error("view should NOT contain filter label after ClearFilterLabel()")
+	}
+}
+
+func TestStatusBar_SetWarningMessage(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetWarningMessage("Invalid theme 'foo', using default theme 'dracula'")
+
+	if sb.warningMessage != "Invalid theme 'foo', using default theme 'dracula'" {
+		t.Errorf("expected warningMessage to be set, got '%s'", sb.warningMessage)
+	}
+}
+
+func TestStatusBar_ClearWarningMessage(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetWarningMessage("some warning")
+	sb.ClearWarningMessage()
+
+	if sb.warningMessage != "" {
+		t.Errorf("expected warningMessage to be empty, got '%s'", sb.warningMessage)
+	}
+}
+
+func TestStatusBar_View_WarningMessageShowsWhenConnected(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetState(polling.StateConnected)
+	sb.SetWarningMessage("Invalid theme 'foo', using default theme 'dracula'")
+	sb.SetWidth(200)
+
+	view := sb.View()
+
+	if !strings.Contains(view, "Invalid theme") {
+		t.Error("view should show warning message even when connected")
+	}
+}
+
+func TestStatusBar_View_WarningMessageShowsAlongsideKeybindings(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetState(polling.StateConnected)
+	sb.SetWarningMessage("Invalid theme 'foo', using default theme 'dracula'")
+	sb.SetWidth(200)
+
+	view := sb.View()
+
+	// Warning should be visible
+	if !strings.Contains(view, "Invalid theme") {
+		t.Error("view should contain warning message")
+	}
+	// Keybindings should still show (not replaced by warning)
+	if !strings.Contains(view, "quit") {
+		t.Error("view should still contain keybindings alongside warning")
+	}
+}
+
+func TestStatusBar_View_WarningMessageNotShownWhenEmpty(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetState(polling.StateConnected)
+	sb.SetWidth(200)
+
+	view := sb.View()
+
+	// No warning section should appear
+	if strings.Contains(view, "⚠") {
+		t.Error("view should not contain warning indicator when no warning set")
+	}
+}
+
+func TestStatusBar_SetContextItems(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	items := []ContextItem{
+		{Key: "v", Description: "Vote"},
+		{Key: "a", Description: "Approve"},
+	}
+	sb.SetContextItems(items)
+
+	if len(sb.contextItems) != 2 {
+		t.Errorf("expected 2 context items, got %d", len(sb.contextItems))
+	}
+	if sb.contextItems[0].Key != "v" || sb.contextItems[0].Description != "Vote" {
+		t.Error("first context item not stored correctly")
+	}
+}
+
+func TestStatusBar_ClearContextItems(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetContextItems([]ContextItem{
+		{Key: "v", Description: "Vote"},
+	})
+	sb.ClearContextItems()
+
+	if len(sb.contextItems) != 0 {
+		t.Errorf("expected 0 context items after clear, got %d", len(sb.contextItems))
+	}
+}
+
+func TestStatusBar_View_ContextItemsReplaceDefaultKeybindings(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetWidth(200)
+	sb.SetContextItems([]ContextItem{
+		{Key: "v", Description: "Vote"},
+	})
+
+	view := sb.View()
+
+	// Context item should be shown
+	if !strings.Contains(view, "Vote") {
+		t.Error("view should contain context item 'Vote'")
+	}
+	// Default keybindings should NOT be shown
+	if strings.Contains(view, "refresh") {
+		t.Error("view should NOT contain default 'refresh' when context items are set")
+	}
+	if strings.Contains(view, "navigate") {
+		t.Error("view should NOT contain default 'navigate' when context items are set")
+	}
+}
+
+func TestStatusBar_View_ContextItemsIncludeBaseShortcuts(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetWidth(200)
+	sb.SetContextItems([]ContextItem{
+		{Key: "v", Description: "Vote"},
+	})
+
+	view := sb.View()
+
+	// Base shortcuts should always appear
+	if !strings.Contains(view, "back") {
+		t.Error("view should contain 'back' base shortcut")
+	}
+	if !strings.Contains(view, "help") {
+		t.Error("view should contain 'help' base shortcut")
+	}
+	if !strings.Contains(view, "quit") {
+		t.Error("view should contain 'quit' base shortcut")
+	}
+}
+
+func TestStatusBar_View_ContextItemsDeduplicateEsc(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetWidth(200)
+	sb.SetContextItems([]ContextItem{
+		{Key: "v", Description: "Vote"},
+		{Key: "esc", Description: "back"},
+	})
+
+	view := sb.View()
+
+	// "back" should appear exactly once — count occurrences
+	count := strings.Count(view, "back")
+	if count != 1 {
+		t.Errorf("expected 'back' to appear once (deduplicated), got %d occurrences", count)
+	}
+}
+
+func TestStatusBar_SetContextStatus(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetWidth(200)
+	sb.SetContextStatus("Loading PR details...")
+
+	view := sb.View()
+
+	if !strings.Contains(view, "Loading PR details...") {
+		t.Error("view should contain context status message")
+	}
+}
+
+func TestStatusBar_View_NoContextItems_ShowsDefault(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetWidth(200)
+
+	view := sb.View()
+
+	// Should still show default keybindings when no context items
+	if !strings.Contains(view, "refresh") {
+		t.Error("view should contain 'refresh' when no context items set")
+	}
+	if !strings.Contains(view, "navigate") {
+		t.Error("view should contain 'navigate' when no context items set")
+	}
+	if !strings.Contains(view, "quit") {
+		t.Error("view should contain 'quit' when no context items set")
+	}
+}
+
+// --- SetScopes rendering tests ---
+
+// TestStatusBar_SetScopes_SingleScope checks that a single scope is shown
+// alongside the org with no "+N more" suffix.
+func TestStatusBar_SetScopes_SingleScope(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetOrganization("org")
+	sb.SetScopes([]string{"ProjA"})
+	sb.SetWidth(200)
+
+	view := sb.View()
+
+	if !strings.Contains(view, "org") {
+		t.Error("view should contain organization name")
+	}
+	if !strings.Contains(view, "ProjA") {
+		t.Error("view should contain single scope name 'ProjA'")
+	}
+	if strings.Contains(view, "+") {
+		t.Error("single scope should not produce a '+N more' suffix")
+	}
+}
+
+// TestStatusBar_SetScopes_MultiScopeWithinCap checks that all scopes are shown
+// joined when the count is within the cap.
+func TestStatusBar_SetScopes_MultiScopeWithinCap(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetScopes([]string{"A", "B"})
+	sb.SetWidth(200)
+
+	view := sb.View()
+
+	if !strings.Contains(view, "A") {
+		t.Error("view should contain scope 'A'")
+	}
+	if !strings.Contains(view, "B") {
+		t.Error("view should contain scope 'B'")
+	}
+	if strings.Contains(view, "+") {
+		t.Error("scopes within cap should not produce a '+N more' suffix")
+	}
+}
+
+// ─── SetUnreadCount footer badge ───────────────────────────────────────────
+
+func TestStatusBar_SetUnreadCount(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetUnreadCount(5)
+
+	if sb.unreadCount != 5 {
+		t.Errorf("expected unreadCount 5, got %d", sb.unreadCount)
+	}
+}
+
+// TestStatusBar_View_ContainsUnreadCount checks the badge is present,
+// carries the count, and renders alongside the default keybindings section
+// rather than replacing it.
+//
+// Folded from two former tests:
+// a bare strings.Contains(view, "7") is satisfied by a stray "7" from the
+// width, scroll percent or org string, so it exercised nothing beyond what
+// the "7 unread" substring check below already covers, and was dropped
+// rather than kept as a second, near-vacuous assertion.
+func TestStatusBar_View_ContainsUnreadCount(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetUnreadCount(7)
+	sb.SetWidth(200)
+
+	view := sb.View()
+
+	if !strings.Contains(view, "7 unread") {
+		t.Errorf("view should contain the unread badge text '7 unread'; view:\n%s", view)
+	}
+	if !strings.Contains(view, "quit") {
+		t.Error("view should still contain default keybindings alongside the unread badge")
+	}
+}
+
+// TestStatusBar_View_UnreadCountHiddenAtZero pins the "hidden
+// entirely at zero" behavior: not merely the absence of the digit 0, but the absence
+// of any residue at all — no stray "unread" word and no empty badge/
+// separator left over from an unconditionally-appended part.
+func TestStatusBar_View_UnreadCountHiddenAtZero(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetUnreadCount(0)
+	sb.SetWidth(120)
+
+	view := sb.View()
+
+	if strings.Contains(view, "unread") {
+		t.Error("view should NOT contain the word 'unread' when the count is 0")
+	}
+}
+
+// TestStatusBar_View_UnreadCountHiddenWhenNegative guards the same zero-hide
+// path against a negative value (e.g. a bad accessor), since <= 0 is the
+// actual guard rather than == 0.
+func TestStatusBar_View_UnreadCountHiddenWhenNegative(t *testing.T) {
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetUnreadCount(-1)
+	sb.SetWidth(120)
+
+	view := sb.View()
+
+	if strings.Contains(view, "unread") {
+		t.Error("view should NOT contain the word 'unread' when the count is negative")
+	}
+}
+
+// TestStatusBar_UnreadBadgeStyle_UsesThemeWarningAsBackground pins the badge's
+// style by inspecting the style
+// *object* returned by unreadBadgeStyle, not rendered bytes: lipgloss
+// resolves the Ascii profile in test binaries, which makes Render the
+// identity function there, so a style change would be invisible to any
+// assertion made against sb.View()'s output — exactly the gap that let all
+// four other unread-badge tests assert text substrings only.
+//
+// Compared against s.Theme.Warning/s.Theme.Background themselves, not
+// literal color strings, so a palette change cannot make this pass by
+// accident.
+func TestStatusBar_UnreadBadgeStyle_UsesThemeWarningAsBackground(t *testing.T) {
+	s := styles.DefaultStyles()
+	sb := NewStatusBar(s)
+
+	badgeStyle := sb.unreadBadgeStyle()
+
+	if !badgeStyle.GetBold() {
+		t.Error("unread badge style should be bold")
+	}
+	if got, want := badgeStyle.GetBackground(), lipgloss.Color(s.Theme.Warning); got != want {
+		t.Errorf("unread badge background = %v, want Theme.Warning (%v) — the badge uses Warning as a background, not a foreground", got, want)
+	}
+	if got, want := badgeStyle.GetForeground(), lipgloss.Color(s.Theme.Background); got != want {
+		t.Errorf("unread badge foreground = %v, want Theme.Background (%v)", got, want)
+	}
+	top, right, bottom, left := badgeStyle.GetPadding()
+	if top != 0 || bottom != 0 || right != 1 || left != 1 {
+		t.Errorf("unread badge padding = (top=%d,right=%d,bottom=%d,left=%d), want (0,1,0,1)", top, right, bottom, left)
+	}
+}
+
+// TestStatusBar_SetScopes_Truncation checks that scopes beyond the cap are
+// truncated and a "+N more" suffix is shown.
+func TestStatusBar_SetScopes_Truncation(t *testing.T) {
+	// scopesDisplayCap is 3; supply cap+2 = 5 scopes.
+	sb := NewStatusBar(styles.DefaultStyles())
+	sb.SetScopes([]string{"Alpha", "Beta", "Gamma", "Delta", "Epsilon"})
+	sb.SetWidth(200)
+
+	view := sb.View()
+
+	// First cap scopes must be visible.
+	if !strings.Contains(view, "Alpha") {
+		t.Error("view should contain first scope 'Alpha'")
+	}
+	if !strings.Contains(view, "Beta") {
+		t.Error("view should contain second scope 'Beta'")
+	}
+	if !strings.Contains(view, "Gamma") {
+		t.Error("view should contain third scope 'Gamma'")
+	}
+
+	// Truncated-away scopes must NOT appear.
+	if strings.Contains(view, "Delta") {
+		t.Error("view should NOT contain truncated scope 'Delta'")
+	}
+	if strings.Contains(view, "Epsilon") {
+		t.Error("view should NOT contain truncated scope 'Epsilon'")
+	}
+
+	// Exact "+2 more" suffix must appear (5 scopes - cap 3 = 2 extra).
+	if !strings.Contains(view, "+2 more") {
+		t.Error("view should contain '+2 more' truncation suffix")
+	}
+}

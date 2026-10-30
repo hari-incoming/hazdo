@@ -1,0 +1,732 @@
+package listview
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/hari-incoming/hazdo/internal/ui/components"
+	"github.com/hari-incoming/hazdo/internal/ui/components/table"
+	"github.com/hari-incoming/hazdo/internal/ui/styles"
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// ViewMode represents the current view in a list UI.
+type ViewMode int
+
+const (
+	ViewList ViewMode = iota
+	ViewDetail
+)
+
+// ColumnSpec defines a column with percentage-based width and minimum.
+type ColumnSpec struct {
+	Title    string
+	WidthPct int
+	MinWidth int
+}
+
+// DetailView is the interface that domain detail models must satisfy.
+type DetailView interface {
+	Update(msg tea.Msg) (DetailView, tea.Cmd)
+	View() string
+	SetSize(width, height int)
+	GetContextItems() []components.ContextItem
+	GetScrollPercent() float64
+	GetStatusMessage() string
+}
+
+// EscapeHandler lets a detail view consume escape for a nested editor or
+// modal before the list view interprets it as "leave detail".
+type EscapeHandler interface {
+	ShouldHandleEscape() bool
+}
+
+// Config holds domain-specific callbacks for a list view.
+type Config[T any] struct {
+	Columns        []ColumnSpec
+	LoadingMessage string
+	EntityName     string // e.g. "pipeline runs" — used in error/empty messages
+	MinWidth       int    // minimum usable width for columns (default 70)
+	ToRows         func(items []T, s *styles.Styles) []table.Row
+	// ToColumns, when non-nil, is called with the current items to derive the
+	// effective column specs. This lets callers vary column count (e.g. a glyph
+	// column) in lock-step with the rows produced by ToRows. When nil, the
+	// static Columns field is used instead, preserving backward compatibility.
+	ToColumns         func(items []T) []ColumnSpec
+	Fetch             func() tea.Cmd
+	EnterDetail       func(item T, s *styles.Styles, w, h int) (DetailView, tea.Cmd)
+	HasContextBar     func(mode ViewMode) bool        // nil = always false
+	FilterFunc        func(item T, query string) bool // nil = search disabled
+	OpenOnDoubleClick bool
+}
+
+// searchBarHeight is the vertical space consumed by the search bar when active.
+const searchBarHeight = 1
+const doubleClickInterval = 500 * time.Millisecond
+
+// Model is the generic list model.
+type Model[T any] struct {
+	table         table.Model
+	items         []T
+	filteredItems []T
+	searching     bool
+	searchInput   textinput.Model
+	searchQuery   string
+	pendingG      bool
+	lastClickAt   time.Time
+	lastClickItem int
+	loading       bool
+	err           error
+	width         int
+	height        int
+	viewMode      ViewMode
+	detail        DetailView
+	spinner       *components.LoadingIndicator
+	styles        *styles.Styles
+	config        Config[T]
+}
+
+func NormalizeWidths(cols []ColumnSpec) {
+	total := 0
+	for _, c := range cols {
+		total += c.WidthPct
+	}
+	if total == 0 {
+		return
+	}
+
+	assigned := 0
+	for i := range cols {
+		if i == len(cols)-1 {
+			cols[i].WidthPct = 100 - assigned // absorb rounding remainder
+		} else {
+			cols[i].WidthPct = cols[i].WidthPct * 100 / total
+			assigned += cols[i].WidthPct
+		}
+	}
+}
+
+// New creates a new generic list model.
+func New[T any](cfg Config[T], s *styles.Styles) Model[T] {
+	minW := cfg.MinWidth
+	if minW == 0 {
+		minW = 70
+	}
+
+	// Determine initial column specs. With an empty item set, ToColumns (when
+	// set) returns the same base layout as the static Columns field would
+	// because MixedKinds([]) == false — no glyph column is prepended.
+	var initialSpecs []ColumnSpec
+	if cfg.ToColumns != nil {
+		initialSpecs = cfg.ToColumns(nil)
+	} else {
+		initialSpecs = cfg.Columns
+	}
+
+	columns := makeColumns(initialSpecs, 80, minW)
+
+	t := table.New(
+		table.WithColumns(columns),
+		table.WithFocused(true),
+		table.WithHeight(10),
+	)
+
+	ts := table.DefaultStyles()
+	ts.Header = s.TableHeader
+	ts.Cell = s.TableCell
+	ts.Selected = s.TableSelected
+	t.SetStyles(ts)
+
+	sp := components.NewLoadingIndicator(s)
+	sp.SetMessage(cfg.LoadingMessage)
+
+	ti := textinput.New()
+	ti.Prompt = "/ "
+	ti.CharLimit = 100
+
+	return Model[T]{
+		table:       t,
+		items:       []T{},
+		searchInput: ti,
+		viewMode:    ViewList,
+		spinner:     sp,
+		styles:      s,
+		config:      cfg,
+	}
+}
+
+// Init initializes the model, starting the fetch and spinner.
+func (m Model[T]) Init() tea.Cmd {
+	m.spinner.SetVisible(true)
+	return tea.Batch(m.config.Fetch(), m.spinner.Init())
+}
+
+// Update handles messages.
+func (m Model[T]) Update(msg tea.Msg) (Model[T], tea.Cmd) {
+	if wmsg, ok := msg.(tea.WindowSizeMsg); ok {
+		m.width = wmsg.Width
+		m.height = wmsg.Height
+	}
+
+	switch m.viewMode {
+	case ViewDetail:
+		return m.updateDetail(msg)
+	default:
+		return m.updateList(msg)
+	}
+}
+
+func (m Model[T]) updateList(msg tea.Msg) (Model[T], tea.Cmd) {
+	var cmd tea.Cmd
+
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		tableHeight := msg.Height - 1 // newline between header and viewport
+		if m.searching {
+			tableHeight -= searchBarHeight
+		}
+		m.table.SetHeight(tableHeight)
+		// Use the items currently shown in the table as the basis for column
+		// recomputation, so the glyph column (when mixed) stays in sync.
+		itemBasis := m.items
+		if m.searching && m.searchQuery != "" && m.filteredItems != nil {
+			itemBasis = m.filteredItems
+		}
+		m.table.SetColumns(makeColumns(m.effectiveColumnSpecs(itemBasis), msg.Width, m.minWidth()))
+
+	case spinner.TickMsg:
+		if m.loading {
+			var spinnerCmd tea.Cmd
+			m.spinner, spinnerCmd = m.spinner.Update(msg)
+			return m, spinnerCmd
+		}
+
+	case tea.KeyMsg:
+		if m.searching {
+			return m.updateSearch(msg)
+		}
+
+		switch msg.String() {
+		case "r":
+			m.loading = true
+			m.spinner.SetVisible(true)
+			return m, tea.Batch(m.config.Fetch(), m.spinner.Tick())
+		case "enter":
+			return m.enterDetailView()
+		case "f", "/":
+			if m.config.FilterFunc != nil {
+				return m.enterSearch()
+			}
+		case "g":
+			if m.pendingG {
+				m.table.GotoTop()
+				m.pendingG = false
+			} else {
+				m.pendingG = true
+			}
+			return m, nil
+		case "G":
+			m.pendingG = false
+			m.table.GotoBottom()
+			return m, nil
+		}
+		m.pendingG = false
+
+	case tea.MouseMsg:
+		if msg.Action == tea.MouseActionPress {
+			switch msg.Button {
+			case tea.MouseButtonWheelUp:
+				m.lastClickAt = time.Time{}
+				m.table.MoveUp(1)
+				return m, nil
+			case tea.MouseButtonWheelDown:
+				m.lastClickAt = time.Time{}
+				m.table.MoveDown(1)
+				return m, nil
+			}
+		}
+		if m.config.OpenOnDoubleClick &&
+			msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
+			row := msg.Y - 1 // The table header occupies the first line.
+			if m.table.SetCursorAtViewportRow(row) {
+				selected := m.table.Cursor()
+				now := time.Now()
+				isDoubleClick := selected == m.lastClickItem &&
+					!m.lastClickAt.IsZero() &&
+					now.Sub(m.lastClickAt) <= doubleClickInterval
+				m.lastClickAt = now
+				m.lastClickItem = selected
+				if isDoubleClick {
+					m.lastClickAt = time.Time{}
+					return m.enterDetailView()
+				}
+				return m, nil
+			}
+			m.lastClickAt = time.Time{}
+		}
+	}
+
+	m.table, cmd = m.table.Update(msg)
+	return m, cmd
+}
+
+func (m Model[T]) enterSearch() (Model[T], tea.Cmd) {
+	m.searching = true
+	m.searchInput.SetValue("")
+	m.searchQuery = ""
+	m.searchInput.Focus()
+
+	// Shrink table by search bar height
+	m.table.SetHeight(m.height - 1 - searchBarHeight)
+
+	return m, m.searchInput.Focus()
+}
+
+func (m Model[T]) exitSearch() (Model[T], tea.Cmd) {
+	m.searching = false
+	m.searchQuery = ""
+	m.searchInput.Blur()
+	m.filteredItems = nil
+
+	// Restore full items in table; use setColumnsAndRows for safe atomic update.
+	m.setColumnsAndRows(m.effectiveColumnSpecs(m.items), m.config.ToRows(m.items, m.styles))
+
+	// Restore table height
+	m.table.SetHeight(m.height - 1)
+
+	return m, nil
+}
+
+func (m Model[T]) updateSearch(msg tea.KeyMsg) (Model[T], tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		return m.exitSearch()
+	case "enter":
+		return m.enterDetailView()
+	case "up", "down", "pgup", "pgdown":
+		// Forward navigation keys to the table
+		m.table, _ = m.table.Update(msg)
+		return m, nil
+	}
+
+	// Forward all other keys to the text input
+	var cmd tea.Cmd
+	m.searchInput, cmd = m.searchInput.Update(msg)
+
+	// Re-apply filter whenever the query changes
+	newQuery := m.searchInput.Value()
+	if newQuery != m.searchQuery {
+		m.searchQuery = newQuery
+		m.applyFilter()
+	}
+
+	return m, cmd
+}
+
+func (m *Model[T]) applyFilter() {
+	if m.searchQuery == "" {
+		m.filteredItems = nil
+		m.setColumnsAndRows(m.effectiveColumnSpecs(m.items), m.config.ToRows(m.items, m.styles))
+		return
+	}
+
+	m.filteredItems = make([]T, 0, len(m.items))
+	for _, item := range m.items {
+		if m.config.FilterFunc(item, m.searchQuery) {
+			m.filteredItems = append(m.filteredItems, item)
+		}
+	}
+	m.setColumnsAndRows(m.effectiveColumnSpecs(m.filteredItems), m.config.ToRows(m.filteredItems, m.styles))
+}
+
+func (m Model[T]) updateDetail(msg tea.Msg) (Model[T], tea.Cmd) {
+	if m.detail == nil {
+		m.viewMode = ViewList
+		return m, nil
+	}
+
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.detail.SetSize(msg.Width, msg.Height)
+
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "esc":
+			if handler, ok := m.detail.(EscapeHandler); ok && handler.ShouldHandleEscape() {
+				var cmd tea.Cmd
+				m.detail, cmd = m.detail.Update(msg)
+				return m, cmd
+			}
+			m.viewMode = ViewList
+			m.detail = nil
+			return m, nil
+		}
+	}
+
+	var cmd tea.Cmd
+	m.detail, cmd = m.detail.Update(msg)
+	return m, cmd
+}
+
+func (m Model[T]) enterDetailView() (Model[T], tea.Cmd) {
+	idx := m.table.Cursor()
+	source := m.items
+	if m.searching && m.filteredItems != nil {
+		source = m.filteredItems
+	}
+	if idx < 0 || idx >= len(source) {
+		return m, nil
+	}
+
+	selectedItem := source[idx]
+	detail, cmd := m.config.EnterDetail(selectedItem, m.styles, m.width, m.height)
+	m.detail = detail
+	m.viewMode = ViewDetail
+
+	return m, cmd
+}
+
+// View renders the view.
+func (m Model[T]) View() string {
+	if m.viewMode == ViewDetail && m.detail != nil {
+		return m.detail.View()
+	}
+	return m.viewList()
+}
+
+func (m Model[T]) viewList() string {
+	var content string
+
+	if m.err != nil {
+		content = fmt.Sprintf("Error loading %s: %v\n\nPress r to retry, q to quit", m.config.EntityName, m.err)
+	} else if m.loading {
+		content = m.spinner.View() + "\n\nPress q to quit"
+	} else if len(m.items) == 0 {
+		content = fmt.Sprintf("No %s found.\n\nPress r to refresh, q to quit", m.config.EntityName)
+	} else {
+		tableView := m.table.View()
+		if m.searching {
+			return tableView + "\n" + m.searchBarView()
+		}
+		return tableView
+	}
+
+	contentStyle := lipgloss.NewStyle().
+		Width(m.width)
+
+	return contentStyle.Render(content)
+}
+
+func (m Model[T]) searchBarView() string {
+	total := len(m.items)
+	matched := total
+	if m.searchQuery != "" && m.filteredItems != nil {
+		matched = len(m.filteredItems)
+	}
+
+	matchInfo := fmt.Sprintf(" %d/%d", matched, total)
+	return m.searchInput.View() + matchInfo
+}
+
+// SetItems sets the items directly (e.g. from polling), clearing loading/error state.
+func (m Model[T]) SetItems(items []T) Model[T] {
+	m.loading = false
+	m.spinner.SetVisible(false)
+	m.err = nil
+	m.items = items
+
+	if m.searching && m.searchQuery != "" && m.config.FilterFunc != nil {
+		m.applyFilter()
+	} else {
+		m.setColumnsAndRows(m.effectiveColumnSpecs(items), m.config.ToRows(items, m.styles))
+	}
+	return m
+}
+
+// HandleFetchResult handles a fetch response (items + error).
+func (m Model[T]) HandleFetchResult(items []T, err error) Model[T] {
+	m.loading = false
+	m.spinner.SetVisible(false)
+	if err != nil {
+		m.err = err
+		return m
+	}
+	m.items = items
+
+	if m.searching && m.searchQuery != "" && m.config.FilterFunc != nil {
+		m.applyFilter()
+	} else {
+		m.setColumnsAndRows(m.effectiveColumnSpecs(items), m.config.ToRows(items, m.styles))
+	}
+	return m
+}
+
+// IsSearching returns true if the list is currently in search/filter mode.
+func (m Model[T]) IsSearching() bool {
+	return m.searching
+}
+
+// Items returns the current items.
+func (m Model[T]) Items() []T {
+	return m.items
+}
+
+// SelectedIndex returns the currently selected table row index.
+func (m Model[T]) SelectedIndex() int {
+	return m.table.Cursor()
+}
+
+// GetViewMode returns the current view mode.
+func (m Model[T]) GetViewMode() ViewMode {
+	return m.viewMode
+}
+
+// Err returns the error from the most recent HandleFetchResult call, or nil
+// when it has since been cleared. Exported so a caller building its own
+// render states on top of listview (e.g. internal/ui/notifications' error
+// state) can branch on the error without listview's own generic
+// "Error loading %s: %v" text.
+//
+// Only SetItems clears this field. HandleFetchResult's *success* path does
+// not (it returns early after setting m.err on the error path, and never
+// assigns nil otherwise), which is a pre-existing
+// bug, not a contract: viewList short-circuits on m.err != nil, so a pane
+// that recovers via HandleFetchResult(items, nil) stays pinned to
+// "Error loading …" forever — reachable today in pullrequests, workitems and
+// pipelines. internal/ui/notifications avoids it by routing its success path
+// through SetFeed -> SetItems. Do not rely on HandleFetchResult to reset it.
+func (m Model[T]) Err() error {
+	return m.err
+}
+
+// Loading reports whether a fetch is currently in flight (spinner visible).
+// Exported for the same reason as Err: a caller overriding listview's own
+// View() needs to tell "no items because still loading" apart from "no items
+// because the feed is genuinely empty" without reaching into the unexported
+// field.
+func (m Model[T]) Loading() bool {
+	return m.loading
+}
+
+// SetLoading sets the loading state directly, showing or hiding the spinner
+// to match. It exists because Init() cannot mutate model state (tea.Model's
+// Init has a value receiver): a caller whose first fetch begins the instant
+// the model is constructed — before Init() is ever called — must be able to
+// mark that fetch in flight at construction time instead, or Loading() reads
+// false while the fetch is outstanding and a caller's own "no items yet"
+// render (guarded on !Loading()) fires prematurely.
+func (m Model[T]) SetLoading(loading bool) Model[T] {
+	m.loading = loading
+	m.spinner.SetVisible(loading)
+	return m
+}
+
+// GetContextItems returns context bar items, delegating to detail when in detail mode.
+func (m Model[T]) GetContextItems() []components.ContextItem {
+	if m.viewMode == ViewDetail && m.detail != nil {
+		return m.detail.GetContextItems()
+	}
+	return nil
+}
+
+// GetScrollPercent returns the scroll percentage, delegating to detail when in detail mode.
+func (m Model[T]) GetScrollPercent() float64 {
+	if m.viewMode == ViewDetail && m.detail != nil {
+		return m.detail.GetScrollPercent()
+	}
+	return 0
+}
+
+// GetStatusMessage returns the status message, delegating to detail when in detail mode.
+func (m Model[T]) GetStatusMessage() string {
+	if m.viewMode == ViewDetail && m.detail != nil {
+		return m.detail.GetStatusMessage()
+	}
+	return ""
+}
+
+// HasContextBar returns whether the current view should show a context bar.
+func (m Model[T]) HasContextBar() bool {
+	if m.config.HasContextBar != nil {
+		return m.config.HasContextBar(m.viewMode)
+	}
+	return false
+}
+
+// Table returns the underlying table model (for domain-specific access).
+func (m Model[T]) Table() table.Model {
+	return m.table
+}
+
+// SetTable sets the underlying table model.
+func (m *Model[T]) SetTable(t table.Model) {
+	m.table = t
+}
+
+// Detail returns the current detail view (may be nil).
+func (m Model[T]) Detail() DetailView {
+	return m.detail
+}
+
+// FindIndex returns the index of the first item in the underlying items
+// list that satisfies pred, or -1 if none match. Search/filter state is
+// ignored — the search runs over the full populated set, which is what
+// startup restore wants.
+func (m Model[T]) FindIndex(pred func(T) bool) int {
+	for i, it := range m.items {
+		if pred(it) {
+			return i
+		}
+	}
+	return -1
+}
+
+// SetCursor moves the table cursor to the given row index. Out-of-range
+// indices are silently ignored.
+func (m *Model[T]) SetCursor(idx int) {
+	if idx < 0 || idx >= len(m.items) {
+		return
+	}
+	m.table.SetCursor(idx)
+}
+
+// OpenSelectedDetail enters the detail view for the row currently under
+// the cursor, returning the detail's Init command (may be nil).
+func (m Model[T]) OpenSelectedDetail() (Model[T], tea.Cmd) {
+	return m.enterDetailView()
+}
+
+// effectiveColumnSpecs returns the column specs for the given items.
+// When config.ToColumns is non-nil it is called with the items; otherwise the
+// static config.Columns slice is returned unchanged.
+func (m Model[T]) effectiveColumnSpecs(items []T) []ColumnSpec {
+	if m.config.ToColumns != nil {
+		return m.config.ToColumns(items)
+	}
+	return m.config.Columns
+}
+
+// minWidth returns the configured minimum table width, defaulting to 70.
+func (m Model[T]) minWidth() int {
+	if m.config.MinWidth != 0 {
+		return m.config.MinWidth
+	}
+	return 70
+}
+
+// setColumnsAndRows updates the table's columns and rows atomically.
+//
+// Both table.SetColumns and table.SetRows call UpdateViewport, which
+// immediately re-renders all existing rows. A naive SetColumns followed by
+// SetRows — or vice versa — leaves a transient state where the cell count
+// and column count differ, causing table.renderRow to panic with an
+// index-out-of-range error.
+//
+// The safe sequence is:
+//  1. Clear rows → UpdateViewport renders zero rows (no renderRow calls).
+//  2. Set columns → UpdateViewport renders zero rows (still safe).
+//  3. Set rows → UpdateViewport renders new rows against new columns (matches).
+//
+// Clearing rows in step 1 resets the cursor to -1 (table.SetRows clamps it).
+// The cursor is saved before and restored after so selection is preserved
+// across updates (e.g. polling refreshes that replace the item set).
+func (m *Model[T]) setColumnsAndRows(specs []ColumnSpec, rows []table.Row) {
+	savedCursor := m.table.Cursor()
+	m.table.SetRows(nil) // clears rows; cursor clamped to -1 by table.SetRows
+	m.table.SetColumns(makeColumns(specs, m.tableWidth(), m.minWidth()))
+	m.table.SetRows(rows)
+	// Restore the cursor, clamping to the new row count. Skip when rows is
+	// empty or the saved cursor was already invalid (< 0).
+	if savedCursor >= 0 && len(rows) > 0 {
+		if savedCursor >= len(rows) {
+			savedCursor = len(rows) - 1
+		}
+		m.table.SetCursor(savedCursor)
+	}
+}
+
+// tableWidth returns the current terminal width used for column sizing,
+// falling back to 80 when no WindowSizeMsg has been received yet.
+func (m Model[T]) tableWidth() int {
+	if m.width > 0 {
+		return m.width
+	}
+	return 80
+}
+
+// cellPadding is the horizontal space added by each table cell's Padding(0, 1) style.
+const cellPadding = 2
+
+// makeColumns creates table columns from specs, sized for the given width.
+// When MinWidth clamps cause the total to exceed available space, the
+// non-clamped columns are proportionally shrunk to compensate.
+func makeColumns(specs []ColumnSpec, width, minWidth int) []table.Column {
+	// Subtract cell padding per column so the total rendered width fits
+	available := width - len(specs)*cellPadding
+	if available < minWidth {
+		available = minWidth
+	}
+
+	widths := make([]int, len(specs))
+	clamped := make([]bool, len(specs))
+
+	// First pass: compute percentage-based widths, clamp to MinWidth
+	for i, spec := range specs {
+		w := available * spec.WidthPct / 100
+		if w < spec.MinWidth {
+			w = spec.MinWidth
+			clamped[i] = true
+		}
+		widths[i] = w
+	}
+
+	// Second pass: if total exceeds available, shrink non-clamped columns
+	total := 0
+	for _, w := range widths {
+		total += w
+	}
+
+	if total > available {
+		overflow := total - available
+		// Sum of non-clamped column widths (the budget we can shrink from)
+		flexTotal := 0
+		for i, w := range widths {
+			if !clamped[i] {
+				flexTotal += w
+			}
+		}
+
+		if flexTotal > 0 {
+			// Shrink each flexible column proportionally
+			shrunk := 0
+			lastFlex := -1
+			for i := range widths {
+				if !clamped[i] {
+					lastFlex = i
+				}
+			}
+			for i := range widths {
+				if !clamped[i] {
+					reduction := overflow * widths[i] / flexTotal
+					if i == lastFlex {
+						reduction = overflow - shrunk // absorb rounding remainder
+					}
+					widths[i] -= reduction
+					if widths[i] < 1 {
+						widths[i] = 1
+					}
+					shrunk += reduction
+				}
+			}
+		}
+	}
+
+	columns := make([]table.Column, len(specs))
+	for i, spec := range specs {
+		columns[i] = table.Column{Title: spec.Title, Width: widths[i]}
+	}
+	return columns
+}

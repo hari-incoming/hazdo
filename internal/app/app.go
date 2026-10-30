@@ -1,0 +1,2158 @@
+package app
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/hari-incoming/hazdo/internal/azdevops"
+	"github.com/hari-incoming/hazdo/internal/config"
+	"github.com/hari-incoming/hazdo/internal/polling"
+	"github.com/hari-incoming/hazdo/internal/provider"
+	"github.com/hari-incoming/hazdo/internal/state"
+	"github.com/hari-incoming/hazdo/internal/ui/components"
+	"github.com/hari-incoming/hazdo/internal/ui/metrics"
+	"github.com/hari-incoming/hazdo/internal/ui/notifications"
+	"github.com/hari-incoming/hazdo/internal/ui/pipelines"
+	"github.com/hari-incoming/hazdo/internal/ui/pullrequests"
+	"github.com/hari-incoming/hazdo/internal/ui/styles"
+	"github.com/hari-incoming/hazdo/internal/ui/workitems"
+	"github.com/hari-incoming/hazdo/internal/version"
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// ThemeNotFoundError represents an error when a requested theme is not found.
+type ThemeNotFoundError struct {
+	ThemeName  string
+	ThemesPath string
+}
+
+func (e *ThemeNotFoundError) Error() string {
+	defaultTheme := styles.GetDefaultTheme()
+	return fmt.Sprintf("Theme '%s' not found, using '%s'. Press 't' to select a theme.",
+		e.ThemeName, defaultTheme.Name)
+}
+
+// Tab represents the active tab in the application
+type Tab int
+
+const (
+	// TabNotifications is the "what needs me now" pane. It is always registered
+	// first in enabledTabs when a configured backend implements
+	// provider.NotificationSource — capability gated, never config gated. Its
+	// number key therefore shifts with whatever else is enabled, same as every
+	// other tab; see enabledTabs.
+	TabNotifications Tab = iota
+	TabPullRequests
+	TabWorkItems
+	TabPipelines
+	TabAvailablePipelines
+	TabMetrics // Metrics dashboard tab (opt-in via metrics.enabled)
+)
+
+// Layout constants for the bordered content area.
+const (
+	// borderWidth is the horizontal space consumed by box side borders (left + right).
+	borderWidth = 2
+
+	// boxBorderRows is the vertical space consumed by the box border itself:
+	// top border (1) + bottom border (1) = 2.
+	boxBorderRows = 2
+
+	// tabBarRows is the vertical space consumed by the bordered tab bar
+	// (which includes the logo): top border (1) + 3 content rows + bottom border (1) = 5.
+	tabBarRows = 5
+)
+
+// updateCheckMsg is sent when the background version check completes.
+type updateCheckMsg struct {
+	info *version.UpdateInfo
+}
+
+// Model is the root application model for the TUI
+type Model struct {
+	// client is the backend-neutral provider used by the three main views
+	// (pull requests, work items, pipelines).
+	client provider.Provider
+
+	// metricsClient is the concrete Azure DevOps client kept for the metrics
+	// view, which calls Azure-only methods not covered by provider.Provider.
+	// Nullable: nil when metrics is disabled or the concrete client was not
+	// supplied.
+	metricsClient *azdevops.MultiClient
+
+	config              *config.Config
+	styles              *styles.Styles
+	activeTab           Tab
+	enabledTabs         []Tab // ordered list of enabled tabs
+	pipelinesView       pipelines.Model
+	definitionsView     pipelines.DefinitionsModel
+	pullRequestsView    pullrequests.Model
+	workItemsView       workitems.Model
+	metricsView         metrics.Model
+	notificationsView   notifications.Model
+	logo                *components.Logo
+	statusBar           *components.StatusBar
+	helpModal           *components.HelpModal
+	errorModal          *components.ErrorModal
+	themePicker         components.ThemePicker
+	addProjectInput     textinput.Model
+	addProjectVisible   bool
+	addProjectError     string
+	addProjectSaved     bool
+	poller              *polling.Poller
+	notificationsPoller *polling.NotificationsPoller
+	errorHandler        *polling.ErrorHandler
+	currentVersion      string
+	commitHash          string
+	width               int
+	height              int
+	footerRows          int
+	err                 error
+	stateStore          *state.Store // optional; nil when persistence is disabled
+
+	// notificationsActionMessage mirrors the last value
+	// notificationsView.GetStatusMessage() had when
+	// syncNotificationsActionMessage last observed it (see that method's doc
+	// comment). Its zero value ("") is correct at startup: the pane reports no
+	// message until an `o` outcome sets one.
+	notificationsActionMessage string
+}
+
+// SetStateStore attaches a state store to the model so navigation changes
+// (active tab, PR / work-item detail) get persisted between runs. Wired
+// up by cmd/azdo-tui; tests may omit it.
+func (m *Model) SetStateStore(s *state.Store) {
+	m.stateStore = s
+}
+
+// tabIDForTab maps the internal Tab iota to the on-disk TabID.
+func tabIDForTab(t Tab) state.TabID {
+	switch t {
+	case TabNotifications:
+		return state.TabNotifications
+	case TabPullRequests:
+		return state.TabPullRequests
+	case TabWorkItems:
+		return state.TabWorkItems
+	case TabPipelines:
+		return state.TabPipelines
+	case TabAvailablePipelines:
+		return state.TabAvailablePipelines
+	}
+	return ""
+}
+
+// tabFromID resolves a persisted TabID back to the internal Tab iota.
+// Unknown IDs return (0, false) so the caller can fall back gracefully. This
+// also covers a TabID that is currently disabled or capability-absent (e.g.
+// "notifications" persisted from a prior GitHub-capable run, restored
+// against an Azure-only config): ApplyState's isTabEnabled check still
+// rejects it and NewModel's default (enabledTabs[0]) stands.
+func tabFromID(id state.TabID) (Tab, bool) {
+	switch id {
+	case state.TabNotifications:
+		return TabNotifications, true
+	case state.TabPullRequests:
+		return TabPullRequests, true
+	case state.TabWorkItems:
+		return TabWorkItems, true
+	case state.TabPipelines:
+		return TabPipelines, true
+	case state.TabAvailablePipelines:
+		return TabAvailablePipelines, true
+	}
+	return 0, false
+}
+
+// ApplyState seeds the model from persisted state at startup: it sets the
+// active tab (when enabled and recognised) and queues per-tab pending
+// detail restores on the sub-models. Detail restores fire on the first
+// list populate; if the persisted ID isn't found the restore silently
+// no-ops — the user lands on the list, never in a broken state.
+func (m *Model) ApplyState(s state.State) {
+	if t, ok := tabFromID(s.ActiveTab); ok && m.isTabEnabled(t) {
+		m.activeTab = t
+	}
+	if ref := s.Tabs.PullRequests.LastDetail; !ref.IsZero() {
+		m.pullRequestsView = m.pullRequestsView.WithPendingDetailRestore(identityFromRef(ref))
+	}
+	if ref := s.Tabs.WorkItems.LastDetail; !ref.IsZero() {
+		m.workItemsView = m.workItemsView.WithPendingDetailRestore(identityFromRef(ref))
+	}
+}
+
+// refFromIdentity converts a neutral provider identity into its serializable
+// state form (stable Kind string + scope + id).
+func refFromIdentity(id provider.Identity) state.DetailRef {
+	return state.DetailRef{Kind: id.Kind.String(), Scope: id.Scope, ID: id.ID}
+}
+
+// identityFromRef is the inverse of refFromIdentity.
+func identityFromRef(ref state.DetailRef) provider.Identity {
+	return provider.Identity{Kind: provider.ParseKind(ref.Kind), Scope: ref.Scope, ID: ref.ID}
+}
+
+// recordActiveTab is a no-op when no store is attached.
+func (m Model) recordActiveTab() {
+	if m.stateStore == nil {
+		return
+	}
+	id := tabIDForTab(m.activeTab)
+	m.stateStore.Apply(func(s *state.State) {
+		s.Version = state.CurrentVersion
+		s.ActiveTab = id
+	})
+}
+
+// recordDetailState captures the currently open detail (if any) for the
+// active tab into the persistent state. Called after delegating to a
+// sub-model in Update, so the snapshot reflects the post-update view mode.
+// Only PR and Work Items tabs participate — Pipelines detail is not
+// restorable by design.
+func (m Model) recordDetailState() {
+	if m.stateStore == nil {
+		return
+	}
+	switch m.activeTab {
+	case TabPullRequests:
+		ref, ok := m.pullRequestsView.DetailRef()
+		m.stateStore.Apply(func(s *state.State) {
+			s.Version = state.CurrentVersion
+			s.Tabs.PullRequests.LastDetail = detailRefOrEmpty(ref, ok)
+		})
+	case TabWorkItems:
+		ref, ok := m.workItemsView.DetailRef()
+		m.stateStore.Apply(func(s *state.State) {
+			s.Version = state.CurrentVersion
+			s.Tabs.WorkItems.LastDetail = detailRefOrEmpty(ref, ok)
+		})
+	}
+}
+
+// detailRefOrEmpty serializes an open detail identity, or returns the zero
+// DetailRef (meaning "no detail open") when the user is on the list.
+func detailRefOrEmpty(id provider.Identity, open bool) state.DetailRef {
+	if !open {
+		return state.DetailRef{}
+	}
+	return refFromIdentity(id)
+}
+
+// containsTab reports whether tab appears in tabs. Split out of isTabEnabled
+// so NewModel can ask the same question of the enabledTabs slice it has just
+// computed, before any Model exists to ask it of. buildEnabledTabs is the only
+// place the "is this tab on" predicate lives, and every other site queries its
+// output instead of recomputing it.
+func containsTab(tabs []Tab, tab Tab) bool {
+	return slices.Contains(tabs, tab)
+}
+
+// isTabEnabled returns true if the given tab is in the enabledTabs list.
+func (m Model) isTabEnabled(tab Tab) bool {
+	return containsTab(m.enabledTabs, tab)
+}
+
+// nextTab returns the next enabled tab after the current one (wrapping).
+func (m Model) nextTab() Tab {
+	for i, t := range m.enabledTabs {
+		if t == m.activeTab {
+			return m.enabledTabs[(i+1)%len(m.enabledTabs)]
+		}
+	}
+	return m.enabledTabs[0]
+}
+
+// prevTab returns the previous enabled tab before the current one (wrapping).
+func (m Model) prevTab() Tab {
+	for i, t := range m.enabledTabs {
+		if t == m.activeTab {
+			prev := i - 1
+			if prev < 0 {
+				prev = len(m.enabledTabs) - 1
+			}
+			return m.enabledTabs[prev]
+		}
+	}
+	return m.enabledTabs[0]
+}
+
+// notificationCapableProvider is the minimal shape *provider.CompositeProvider
+// exposes for the notifications capability check. Asserting p directly against
+// provider.NotificationSource does not work here: the composite satisfies
+// that interface unconditionally (see its HasNotifications doc comment), so
+// such an assertion would report capability even for an Azure-only config
+// with no GitHub backend at all. HasNotifications performs the real
+// per-backend type assertion and is what must be called instead.
+type notificationCapableProvider interface {
+	HasNotifications() bool
+}
+
+// hasNotificationCapability reports whether p — or nil, in which case it is
+// false — has at least one backend implementing provider.NotificationSource.
+// This is the sole gate for the notifications tab's presence; it is never
+// derived from config and never from whether the feed is empty.
+func hasNotificationCapability(p provider.Provider) bool {
+	nc, ok := p.(notificationCapableProvider)
+	if !ok {
+		return false
+	}
+	return nc.HasNotifications()
+}
+
+// notificationMarker returns p as a provider.NotificationSource for the
+// notifications pane's u/d mark actions, or nil when p does not implement it —
+// including when p is an *untyped* nil interface, which fails the assertion. A
+// *typed* nil does not: `var cp *provider.CompositeProvider; NewModel(cp, ...)`
+// satisfies the assertion and yields a non-nil interface wrapping a nil
+// pointer, so the pane's `m.marker == nil` guard is false and markCmd derefs it
+// (convention 15's shape). Unreachable today — cmd/azdo-tui/main.go always
+// constructs a real *CompositeProvider and internal/demo/demo.go a concrete
+// adapter — and hasNotificationCapability above has the identical exposure.
+// Unlike hasNotificationCapability, this does not additionally require
+// HasNotifications(): *provider.CompositeProvider.MarkRead/MarkDone already
+// route by Identity.Kind and report a descriptive per-kind error when no
+// backend matches, so the plain type assertion is the correct level here — the
+// pane never needs to know which kinds are routable, only whether it has
+// something to call at all.
+func notificationMarker(p provider.Provider) provider.NotificationSource {
+	marker, _ := p.(provider.NotificationSource)
+	return marker
+}
+
+// notificationsPollerClient returns notificationMarker(p) as a
+// polling.NotificationsClient, but only when p has real notifications
+// capability (hasNotificationCapability); otherwise it returns nil. This is
+// belt-and-braces alongside gating the poller's timer in Init(): notifiedMarker
+// alone would hand *provider.CompositeProvider to the poller unconditionally,
+// since notificationMarker deliberately does not call HasNotifications() —
+// documented in notificationMarker's own comment as correct for the pane's
+// mark routing, but wrong for the poller's construction, which must self-defend
+// even if some future caller ever starts the timer without checking
+// hasNotificationCapability first.
+func notificationsPollerClient(p provider.Provider) polling.NotificationsClient {
+	if !hasNotificationCapability(p) {
+		return nil
+	}
+	return notificationMarker(p)
+}
+
+// notificationsIntervalHinter is satisfied by a provider.Provider whose
+// underlying backend(s) can report a server-suggested notifications polling
+// cadence -- currently only *provider.CompositeProvider, via its
+// NotificationsPollInterval method. This mirrors hasNotificationCapability's
+// and notificationMarker's narrow, per-capability type assertion rather than
+// adding a method to provider.Provider itself.
+type notificationsIntervalHinter interface {
+	NotificationsPollInterval() time.Duration
+}
+
+// notificationsPollIntervalHint returns p's server-suggested notifications
+// polling cadence, or 0 when p does not implement notificationsIntervalHinter.
+// Callers must treat 0 as "no hint available" -- either because no capable
+// backend implements provider.PollIntervalHinter, or because none has
+// completed a fetch yet -- exactly as provider.PollIntervalHinter's own doc
+// comment requires.
+func notificationsPollIntervalHint(p provider.Provider) time.Duration {
+	hinter, ok := p.(notificationsIntervalHinter)
+	if !ok {
+		return 0
+	}
+	return hinter.NotificationsPollInterval()
+}
+
+// notificationsConfiguredInterval returns the configured notifications
+// polling interval: cfg.Notifications.PollInterval if positive, falling back
+// to cfg.PollingInterval, and finally to polling.DefaultInterval. A nil cfg
+// returns polling.DefaultInterval. NewNotificationsPoller and SetInterval
+// both additionally floor the result at polling.MinInterval, which is what
+// keeps a configured notifications.poll_interval: 1 (accepted by config
+// validation -- it only requires >= 0) from producing sub-MinInterval
+// polling against GitHub.
+func notificationsConfiguredInterval(cfg *config.Config) time.Duration {
+	if cfg == nil {
+		return polling.DefaultInterval
+	}
+	if cfg.Notifications.PollInterval > 0 {
+		return time.Duration(cfg.Notifications.PollInterval) * time.Second
+	}
+	if cfg.PollingInterval > 0 {
+		return time.Duration(cfg.PollingInterval) * time.Second
+	}
+	return polling.DefaultInterval
+}
+
+// notificationsPollInterval computes the notifications poller's cadence:
+// max(configured interval, server hint). A hint of 0 (no capable backend, or
+// none has completed a fetch yet) leaves the configured interval untouched.
+func notificationsPollInterval(p provider.Provider, cfg *config.Config) time.Duration {
+	configured := notificationsConfiguredInterval(cfg)
+	hint := notificationsPollIntervalHint(p)
+	if hint > configured {
+		return hint
+	}
+	return configured
+}
+
+// buildEnabledTabs returns the list of enabled tabs based on config.
+// azurePresent must be true when a live Azure MultiClient is available;
+// the metrics tab requires both cfg.Metrics.Enabled AND azurePresent.
+// notifCapable must be true when at least one configured backend implements
+// provider.NotificationSource — see hasNotificationCapability. When the Azure
+// pipeline browser is available, All Pipelines is first and Active Pipelines
+// is second; Notifications follows the PR, work-item, and active-pipeline tabs.
+// Without the browser, the legacy Notifications-first ordering is preserved.
+func buildEnabledTabs(cfg *config.Config, azurePresent bool, notifCapable bool) []Tab {
+	var tabs []Tab
+	hasPipelineBrowser := cfg.IsPaneEnabled("pipelines") && azurePresent && cfg.HasAzure()
+	if hasPipelineBrowser {
+		tabs = append(tabs, TabAvailablePipelines)
+	}
+	if !hasPipelineBrowser && cfg.IsPaneEnabled("notifications") && notifCapable {
+		tabs = append(tabs, TabNotifications)
+	}
+	if hasPipelineBrowser {
+		tabs = append(tabs, TabPipelines)
+	}
+	if cfg.IsPaneEnabled("pullrequests") {
+		tabs = append(tabs, TabPullRequests)
+	}
+	if cfg.IsPaneEnabled("workitems") {
+		tabs = append(tabs, TabWorkItems)
+	}
+	if !hasPipelineBrowser && cfg.IsPaneEnabled("pipelines") {
+		tabs = append(tabs, TabPipelines)
+	}
+	if hasPipelineBrowser && cfg.IsPaneEnabled("notifications") && notifCapable {
+		tabs = append(tabs, TabNotifications)
+	}
+	if cfg.Metrics.Enabled && azurePresent {
+		tabs = append(tabs, TabMetrics)
+	}
+	return tabs
+}
+
+// helpTabName returns the label the help modal's Tabs binding uses for tab.
+// Config keys MUST be lowercase — viper lowercases every config key on load,
+// so Terms map keys arrive lowercase and a capitalised lookup silently never
+// matches the user's override (convention 9).
+//
+// Deliberately not renderTabBar's label map: the modal has rendered "PR" for
+// pull requests since before notifications existed (help.go's NewHelpModal
+// seeds "PR / Work Items / Active Pipelines") and the line is width-constrained, so
+// the two label sets differ on purpose. What must NOT differ is the *order* or
+// the *membership*, which is why the caller walks enabledTabs rather than
+// re-listing panes.
+func helpTabName(cfg *config.Config, tab Tab) string {
+	switch tab {
+	case TabNotifications:
+		return cfg.TermFor("notifications", "Notifications")
+	case TabPullRequests:
+		return "PR"
+	case TabWorkItems:
+		return cfg.TermFor("work_items", "Work Items")
+	case TabPipelines:
+		return cfg.TermFor("pipelines", "Active Pipelines")
+	case TabAvailablePipelines:
+		return "All Pipelines"
+	case TabMetrics:
+		return cfg.TermFor("metrics", "Metrics")
+	}
+	return ""
+}
+
+func configureHelpTabs(help *components.HelpModal, cfg *config.Config, tabs []Tab) {
+	names := make([]string, 0, len(tabs))
+	keys := make([]string, len(tabs))
+	for i, tab := range tabs {
+		names = append(names, helpTabName(cfg, tab))
+		keys[i] = fmt.Sprintf("%d", i+1)
+	}
+	help.UpdateTabsBinding(strings.Join(keys, "/"), strings.Join(names, " / "))
+}
+
+// initTabCmd returns the Init command for the given tab, or nil for pipelines
+// (which is populated by the poller).
+func (m Model) initTabCmd(tab Tab) tea.Cmd {
+	switch tab {
+	case TabNotifications:
+		return m.notificationsView.Init()
+	case TabPullRequests:
+		return m.pullRequestsView.Init()
+	case TabWorkItems:
+		return m.workItemsView.Init()
+	case TabMetrics:
+		return m.metricsView.Init()
+	case TabAvailablePipelines:
+		return m.definitionsView.Init()
+	}
+	return nil
+}
+
+// formatVersionInfo formats the version and commit hash for display.
+// For example: "1.2.3 (abc1234)" or "dev (none)".
+func formatVersionInfo(version, commit string) string {
+	if commit != "" && commit != "none" {
+		return fmt.Sprintf("%s (%s)", version, commit)
+	}
+	return version
+}
+
+// displayScopes returns the human-readable scope labels for the status bar,
+// drawn from the provider's full scope union (every configured Azure project and
+// GitHub repo) rather than just cfg.Projects — so a mixed Azure+GitHub setup
+// shows all backends, not only the Azure ones. Each scope is mapped through
+// DisplayNameFor, which returns Azure projects' display names and passes GitHub
+// "owner/repo" scopes through unchanged.
+//
+// When p is nil (provider-backed features disabled, e.g. in tests) it falls back
+// to cfg.Projects, reproducing the original Azure-only output. For a real
+// Azure-only run the composite's Scopes() equals cfg.Projects, so the output is
+// identical either way — zero behavior change for today's Azure-only users.
+func displayScopes(p provider.Provider, cfg *config.Config) []string {
+	raw := cfg.Projects
+	if p != nil {
+		raw = p.Scopes()
+	}
+	scopes := make([]string, len(raw))
+	for i, s := range raw {
+		scopes[i] = cfg.DisplayNameFor(s)
+	}
+	return scopes
+}
+
+// NewModel creates a new application model.
+//
+// p is the backend-neutral provider used by the three main views. Pass nil to
+// disable provider-backed features (e.g. in tests that don't exercise view
+// fetching).
+//
+// mc is the concrete Azure DevOps multi-client, stored on Model.metricsClient
+// for the metrics view, which requires Azure-specific methods not covered by
+// provider.Provider.
+func NewModel(p provider.Provider, mc *azdevops.MultiClient, cfg *config.Config, currentVersion string, commitHash string) Model {
+	// Create error handler early to capture initialization errors
+	errorHandler := polling.NewErrorHandler()
+
+	// Load custom themes from themes directory
+	if themesDir, err := styles.GetThemesDirectoryPath(); err != nil {
+		// Failed to get themes directory path
+		errorHandler.SetError(fmt.Errorf("failed to access themes directory: %w", err))
+	} else {
+		// Try to load custom themes
+		_, err := styles.LoadCustomThemesFromDirectory(themesDir)
+		if err != nil {
+			// Failed to load custom themes - set error but continue
+			errorHandler.SetError(fmt.Errorf("failed to load custom themes from %s: %w", themesDir, err))
+		}
+	}
+
+	// Try to load the requested theme
+	requestedTheme := cfg.GetTheme()
+	theme, themeErr := styles.GetThemeByName(requestedTheme)
+	if themeErr != nil {
+		// Fall back to default theme
+		theme = styles.GetDefaultTheme()
+	}
+
+	appStyles := styles.NewStyles(theme)
+
+	// Create logo
+	logo := components.NewLogo(appStyles)
+
+	// Create status bar with org/project info
+	statusBar := components.NewStatusBar(appStyles)
+	statusBar.SetOrganization(cfg.Organization)
+	statusBar.SetScopes(displayScopes(p, cfg))
+
+	// Gate metrics on both the config flag and a live Azure backend.
+	// The metrics view uses Azure-specific APIs not available via provider.Provider,
+	// so it must only be enabled when a concrete MultiClient is present.
+	metricsEnabled := cfg.Metrics.Enabled && mc != nil
+
+	// Gate notifications on capability alone, never on config: the tab is
+	// absent unless a configured backend implements provider.NotificationSource,
+	// and present (possibly empty) whenever one does. disabled_panes still
+	// applies on top, same as every other pane.
+	//
+	// buildEnabledTabs is the single owner of that predicate: enabledTabs is
+	// computed here, up front, and everything downstream that needs to know
+	// whether a tab is on — the help modal's tab-name list, the Model's own
+	// enabledTabs field, containsTab/isTabEnabled queries — derives from it
+	// rather than restating `IsPaneEnabled && capable` or the tab order.
+	// Restating either is what let copies drift: dropping the IsPaneEnabled
+	// conjunct from a second copy left the tab strip and the help modal free to
+	// disagree with nothing failing. Ask containsTab(enabledTabs,
+	// TabNotifications) if you need the predicate.
+	enabledTabs := buildEnabledTabs(cfg, mc != nil, hasNotificationCapability(p))
+
+	// Create help modal
+	helpModal := components.NewHelpModal(appStyles)
+
+	// Configure help modal based on disabled panes
+	if !cfg.IsPaneEnabled("pullrequests") {
+		helpModal.RemoveSection("Code Review (PR diff)")
+		helpModal.RemoveBindingsByDescription("reviewer")
+		helpModal.RemoveBindingsByDescription("Vote on PR")
+	}
+	if !cfg.IsPaneEnabled("workitems") {
+		helpModal.RemoveBindingsByDescription("work items")
+		helpModal.RemoveBindingsByDescription("work item")
+	}
+	if !cfg.IsPaneEnabled("pipelines") {
+		helpModal.RemoveSection("Log Viewer (pipelines)")
+		helpModal.RemoveBindingsByDescription("pipelines")
+	}
+
+	// Derive the help tabs line from the same ordered set as the rendered tabs.
+	configureHelpTabs(helpModal, cfg, enabledTabs)
+	if metricsEnabled {
+		helpModal.AddSection("Metrics tab", []components.HelpBinding{
+			{Key: "v", Description: "Toggle Live ↔ Trends sub-view"},
+			{Key: "Tab", Description: "Switch focus between stuck-items and per-user pane (Live)"},
+			{Key: "↑/↓", Description: "Live: move cursor; Trends: scroll"},
+			{Key: "pgup/pgdn", Description: "Scroll dashboard body"},
+			{Key: "f", Description: "Cycle flag filter — Live only (All / Active-stale / RFT-stale)"},
+			{Key: "T", Description: "Live: filter by tag. Trends: multi-select sprint picker"},
+			{Key: "esc", Description: "Clear tag filter (Live)"},
+			{Key: "o", Description: "Open focused item in browser (Live)"},
+			{Key: "r", Description: "Refresh metrics + reload snapshot file"},
+		})
+	}
+
+	// Notifications tab section. Gated on containsTab(enabledTabs,
+	// TabNotifications) — the single predicate buildEnabledTabs already computed
+	// above — never a second copy of cfg.IsPaneEnabled("notifications") &&
+	// hasNotificationCapability(p); see the comment above the buildEnabledTabs
+	// call for why that predicate must not be restated here.
+	//
+	// Lists exactly the keys internal/ui/notifications/list.go's Update switch
+	// handles: `f` (reason cycle), `u` (mark read, one-way), `d` (mark done),
+	// and `o` (open the selected row's WebURL). `enter`/`esc` are left out:
+	// EnterDetail's stub makes `enter` a harmless one-keypress round trip
+	// through listview's detail mode with nothing to show (not a real
+	// "expand/view details" action), and both keys are already covered
+	// generically by the Navigation section.
+	if containsTab(enabledTabs, TabNotifications) {
+		helpModal.AddSection("Notifications tab", []components.HelpBinding{
+			{Key: "f", Description: "Cycle reason filter"},
+			{Key: "u", Description: "Mark read (one-way)"},
+			{Key: "d", Description: "Mark done"},
+			{Key: "o", Description: "Open in browser"},
+		})
+	}
+	if containsTab(enabledTabs, TabAvailablePipelines) {
+		helpModal.AddSection("Pipeline definitions", []components.HelpBinding{
+			{Key: "/", Description: "Search names, paths, and projects"},
+			{Key: "enter", Description: "Open pipeline variables"},
+			{Key: "v", Description: "View history for the selected pipeline"},
+			{Key: "e", Description: "Edit branch or variable"},
+			{Key: "A / a", Description: "Save variable (secret option) / add for this run"},
+			{Key: "d", Description: "Reset override"},
+			{Key: "P", Description: "Add Azure DevOps project"},
+			{Key: "r", Description: "Queue pipeline with current overrides"},
+			{Key: "esc", Description: "Back"},
+		})
+	}
+
+	// Set version info in help modal
+	helpModal.SetVersionInfo(formatVersionInfo(currentVersion, commitHash))
+
+	// List every configured backend scope (Azure projects + GitHub repos).
+	helpModal.SetScopes(displayScopes(p, cfg))
+
+	// Set config path in help modal
+	if configPath, err := config.GetPath(); err == nil {
+		helpModal.SetConfigPath(configPath)
+	}
+
+	// Create error modal
+	errorModal := components.NewErrorModal(appStyles)
+
+	// Create theme picker
+	availableThemes := styles.ListAvailableThemes()
+	themePicker := components.NewThemePicker(appStyles, availableThemes, cfg.GetTheme())
+	addProjectInput := textinput.New()
+	addProjectInput.Placeholder = "Azure DevOps project name"
+	addProjectInput.CharLimit = 128
+	addProjectInput.Width = 48
+
+	// Create poller with configured interval. The poller fetches through the
+	// composite provider p, so initial load and every periodic tick fan out to
+	// all configured backends (Azure DevOps and/or GitHub) — not just Azure.
+	interval := time.Duration(cfg.PollingInterval) * time.Second
+	if interval <= 0 {
+		interval = polling.DefaultInterval
+	}
+	poller := polling.NewPoller(p, interval)
+
+	// The notifications poller mirrors the pipeline poller above but is a
+	// distinct type with its own cadence: max(configured, hint) is computed once
+	// here, up front, and recomputed after every fetch (see the
+	// polling.NotificationsFetchedMsg case in Update) since a GitHub hint only
+	// becomes known once the adapter has actually observed an X-Poll-Interval
+	// response header.
+	notificationsPoller := polling.NewNotificationsPoller(
+		notificationsPollerClient(p),
+		notificationsPollInterval(p, cfg),
+		notifications.NotifOptsFromConfig(cfg),
+	)
+
+	// If theme was not found, set a friendly error message
+	if themeErr != nil {
+		themesDir, _ := styles.GetThemesDirectoryPath()
+		themeNotFoundErr := &ThemeNotFoundError{
+			ThemeName:  requestedTheme,
+			ThemesPath: themesDir,
+		}
+		errorHandler.SetError(themeNotFoundErr)
+	}
+
+	var mv metrics.Model
+	if metricsEnabled {
+		mv = metrics.NewModelWithStyles(mc, cfg, appStyles)
+	}
+
+	// The notifications pane is constructed unconditionally, even when the tab
+	// is disabled or capability-absent. It deliberately does not follow the
+	// metrics view's conditional pattern above: the zero value IS reachable —
+	// the tea.WindowSizeMsg handler calls
+	// m.notificationsView.Update(contentSize) on every resize and
+	// ThemeSelectedMsg reconstructs the pane, both unconditionally — and it is
+	// not inert, because listview.Init and SetFeed dereference the zero value's
+	// nil *components.LoadingIndicator and panic
+	// (internal/ui/components/spinner.go's Tick). Constructing here removes the
+	// hazard instead of documenting it.
+	nv := notifications.NewModelWithStyles(appStyles, notificationMarker(p), cfg)
+
+	return Model{
+		client:              p,
+		metricsClient:       mc,
+		config:              cfg,
+		styles:              appStyles,
+		activeTab:           enabledTabs[0],
+		enabledTabs:         enabledTabs,
+		logo:                logo,
+		pipelinesView:       pipelines.NewModelWithAzureClient(p, mc, appStyles),
+		definitionsView:     pipelines.NewDefinitionsModel(mc, appStyles),
+		pullRequestsView:    pullrequests.NewModelWithStyles(p, appStyles),
+		workItemsView:       workitems.NewModelWithStyles(p, appStyles),
+		metricsView:         mv,
+		notificationsView:   nv,
+		statusBar:           statusBar,
+		helpModal:           helpModal,
+		errorModal:          errorModal,
+		themePicker:         themePicker,
+		addProjectInput:     addProjectInput,
+		poller:              poller,
+		notificationsPoller: notificationsPoller,
+		errorHandler:        errorHandler,
+		currentVersion:      currentVersion,
+		commitHash:          commitHash,
+	}
+}
+
+// Init initializes the application
+func (m Model) Init() tea.Cmd {
+	// Check for any startup errors (e.g., theme not found)
+	// Use warning message so it persists even after successful polling
+	if m.errorHandler.ShouldShowError() {
+		m.statusBar.SetWarningMessage(m.errorHandler.ErrorMessage())
+	}
+
+	initCmds := []tea.Cmd{
+		m.poller.FetchPipelineRuns(), // Initial fetch - updates connection state
+		m.poller.StartPolling(),      // Start polling timer
+		m.notificationsStartPollingCmd(),
+		checkForUpdate(m.currentVersion),
+	}
+
+	// Initialize the active tab's view. After ApplyState, this may be a
+	// non-default tab restored from persisted state.
+	if cmd := m.initTabCmd(m.activeTab); cmd != nil {
+		initCmds = append(initCmds, cmd)
+	}
+	// PR is the canonical default; ensure its data is preloaded even when
+	// state restored a different tab so switching back is instant. Skipped
+	// entirely when the PR pane is disabled.
+	if m.isTabEnabled(TabPullRequests) && m.activeTab != TabPullRequests {
+		initCmds = append(initCmds, m.pullRequestsView.Init())
+	}
+	// Notifications' own initTabCmd already issues the first fetch when it IS
+	// the active tab; this preload guard covers every other case (a
+	// different active tab, or notifications not the default) so switching
+	// to it later is instant -- mirroring the PR preload immediately above.
+	// Skipped when the tab is absent entirely (capability gate, or
+	// disabled_panes).
+	if m.isTabEnabled(TabNotifications) && m.activeTab != TabNotifications {
+		initCmds = append(initCmds, m.notificationsPoller.FetchNotifications())
+	}
+
+	return tea.Batch(initCmds...)
+}
+
+// notificationsStartPollingCmd arms the notifications poller's own timer, but
+// only when the notifications tab is actually present: m.isTabEnabled checks
+// membership in m.enabledTabs, which buildEnabledTabs only includes the
+// notifications tab into when both the capability gate (notifCapable) and
+// cfg.IsPaneEnabled("notifications") hold — exactly the "capability AND
+// pane-enabled" predicate the timer must be gated on. Without this gate,
+// m.notificationsPoller.StartPolling() ran unconditionally in Init(),
+// permanently re-arming a GitHub poll loop even when the tab is disabled or the
+// provider has no notifications-capable backend at all.
+func (m Model) notificationsStartPollingCmd() tea.Cmd {
+	if !m.isTabEnabled(TabNotifications) {
+		return nil
+	}
+	return m.notificationsPoller.StartPolling()
+}
+
+// checkForUpdate returns a tea.Cmd that checks GitHub for a newer version.
+// Failures are silently ignored.
+func checkForUpdate(currentVersion string) tea.Cmd {
+	return func() tea.Msg {
+		checker := version.NewChecker(currentVersion)
+		info, err := checker.CheckForUpdate()
+		if err != nil {
+			// Silently ignore errors — don't disrupt the user
+			return nil
+		}
+		return updateCheckMsg{info: info}
+	}
+}
+
+// releaseNotesCount is how many recent releases the help modal displays.
+const releaseNotesCount = 5
+
+// releaseNotesMsg carries the result of the on-demand release-notes fetch for
+// the help modal. A non-nil err indicates the fetch failed.
+type releaseNotesMsg struct {
+	notes []version.ReleaseNote
+	err   error
+}
+
+// fetchReleaseNotes returns a tea.Cmd that loads the most recent releases at or
+// below the current version, for display in the help modal's Release Notes
+// section. Dispatched lazily the first time the modal is opened.
+func fetchReleaseNotes(currentVersion string) tea.Cmd {
+	return func() tea.Msg {
+		checker := version.NewChecker(currentVersion)
+		notes, err := checker.LatestReleaseNotes(releaseNotesCount)
+		if err != nil {
+			return releaseNotesMsg{err: err}
+		}
+		return releaseNotesMsg{notes: notes}
+	}
+}
+
+// Update handles incoming messages and updates the model
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmds []tea.Cmd
+
+	// Release-notes fetch results are handled up front so they land in the help
+	// modal whether or not it is still visible when the fetch completes.
+	if rn, ok := msg.(releaseNotesMsg); ok {
+		if rn.err != nil {
+			m.helpModal.SetReleaseNotesError()
+		} else {
+			m.helpModal.SetReleaseNotes(rn.notes)
+		}
+		return m, nil
+	}
+
+	// If error modal is visible, handle its input first (highest priority)
+	if m.errorModal.IsVisible() {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			m.errorModal, _ = m.errorModal.Update(msg)
+			return m, nil
+		case tea.WindowSizeMsg:
+			m.width = msg.Width
+			m.height = msg.Height
+			m.errorModal.SetSize(msg.Width, msg.Height)
+			m.statusBar.SetWidth(msg.Width)
+			return m, nil
+		}
+		return m, nil
+	}
+
+	if m.addProjectVisible {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			switch msg.String() {
+			case "esc":
+				m.closeAddProjectModal()
+				return m, nil
+			case "enter":
+				if !m.addProjectSaved {
+					if err := m.saveAzureProject(m.addProjectInput.Value()); err != nil {
+						m.addProjectError = err.Error()
+					} else {
+						m.addProjectSaved = true
+						m.addProjectInput.Blur()
+					}
+				}
+				return m, nil
+			default:
+				if !m.addProjectSaved {
+					m.addProjectError = ""
+					var cmd tea.Cmd
+					m.addProjectInput, cmd = m.addProjectInput.Update(msg)
+					return m, cmd
+				}
+			}
+		case tea.WindowSizeMsg:
+			m.width = msg.Width
+			m.height = msg.Height
+			m.statusBar.SetWidth(msg.Width)
+			m.addProjectInput.Width = max(20, min(60, msg.Width-12))
+		}
+		return m, nil
+	}
+
+	// If help modal is visible, handle its input first
+	if m.helpModal.IsVisible() {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			m.helpModal, _ = m.helpModal.Update(msg)
+			return m, nil
+		case tea.WindowSizeMsg:
+			m.width = msg.Width
+			m.height = msg.Height
+			m.helpModal.SetSize(msg.Width, msg.Height)
+			m.statusBar.SetWidth(msg.Width)
+			return m, nil
+		}
+		return m, nil
+	}
+
+	// If theme picker is visible, handle its input first
+	if m.themePicker.IsVisible() {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			var cmd tea.Cmd
+			m.themePicker, cmd = m.themePicker.Update(msg)
+			return m, cmd
+		case tea.WindowSizeMsg:
+			m.width = msg.Width
+			m.height = msg.Height
+			m.themePicker.SetSize(msg.Width, msg.Height)
+			return m, nil
+		}
+		return m, nil
+	}
+
+	if mouse, ok := msg.(tea.MouseMsg); ok && mouse.Action == tea.MouseActionPress {
+		switch mouse.Button {
+		case tea.MouseButtonWheelUp:
+			msg = tea.KeyMsg{Type: tea.KeyUp}
+		case tea.MouseButtonWheelDown:
+			msg = tea.KeyMsg{Type: tea.KeyDown}
+		case tea.MouseButtonLeft:
+			if mouse.Y >= 0 && mouse.Y < tabBarRows {
+				if target, found := m.tabAtPosition(mouse.X, mouse.Y); found && target != m.activeTab {
+					m.activeTab = target
+					m.resizeActiveViewIfNeeded()
+					m.recordActiveTab()
+					return m, m.initTabCmd(target)
+				}
+				return m, nil
+			}
+			if offset := m.mouseContentYOffset(); offset > 0 {
+				mouse.Y -= offset
+				msg = mouse
+			}
+		}
+	}
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		// When a child view is in search mode or has a modal picker open,
+		// skip all global shortcuts so keystrokes reach the input instead.
+		if m.isActiveViewCapturingInput() {
+			break
+		}
+
+		switch msg.String() {
+		case "q", "ctrl+c":
+			m.poller.Stop()
+			m.notificationsPoller.Stop()
+			return m, tea.Quit
+		case "?":
+			m.helpModal.SetSize(m.width, m.height)
+			m.helpModal.Show()
+			// Load release notes on demand the first time the modal is opened.
+			if m.helpModal.NeedsReleaseNotes() {
+				m.helpModal.BeginReleaseNotesLoad()
+				return m, fetchReleaseNotes(m.currentVersion)
+			}
+			return m, nil
+		case "t":
+			m.themePicker.SetSize(m.width, m.height)
+			m.themePicker.Show()
+			return m, nil
+		case "P":
+			if m.activeTab == TabAvailablePipelines &&
+				m.definitionsView.IsShowingDefinitionList() &&
+				!m.definitionsView.IsSearching() &&
+				m.config != nil && m.config.HasAzure() {
+				m.openAddProjectModal()
+				return m, m.addProjectInput.Focus()
+			}
+		case "1", "2", "3", "4", "5", "6":
+			// Up to six tabs can be enabled at once when notifications and
+			// metrics are present alongside the Azure pipeline browser.
+			// The mapping stays purely positional into m.enabledTabs, which
+			// is why notifications landing first automatically shifts every
+			// other tab's number without a dedicated case here.
+			idx := int(msg.String()[0]-'0') - 1 // "1"→0, "2"→1, "3"→2, "4"→3, "5"→4
+			if idx >= 0 && idx < len(m.enabledTabs) {
+				target := m.enabledTabs[idx]
+				if target != m.activeTab {
+					m.activeTab = target
+					m.resizeActiveViewIfNeeded()
+					m.recordActiveTab()
+					return m, m.initTabCmd(target)
+				}
+			}
+			return m, nil
+		case "left", "h":
+			prev := m.prevTab()
+			if prev != m.activeTab {
+				m.activeTab = prev
+				m.resizeActiveViewIfNeeded()
+				m.recordActiveTab()
+				return m, m.initTabCmd(prev)
+			}
+			return m, nil
+		case "right", "l":
+			next := m.nextTab()
+			if next != m.activeTab {
+				m.activeTab = next
+				m.resizeActiveViewIfNeeded()
+				m.recordActiveTab()
+				return m, m.initTabCmd(next)
+			}
+			return m, nil
+		}
+
+	case components.ThemeSelectedMsg:
+		// Update theme in config and save
+		if err := m.config.UpdateTheme(msg.ThemeName); err != nil {
+			// Handle error - set error message in status bar
+			m.errorHandler.SetError(fmt.Errorf("failed to save theme: %w", err))
+			m.statusBar.SetState(polling.StateError)
+			m.statusBar.SetErrorMessage(fmt.Sprintf("Failed to save theme setting: %v", err))
+			return m, nil
+		}
+
+		// Load the new theme
+		theme, err := styles.GetThemeByName(msg.ThemeName)
+		if err != nil {
+			// Handle error - this shouldn't happen as we selected from available themes
+			m.errorHandler.SetError(fmt.Errorf("failed to load theme: %w", err))
+			m.statusBar.SetState(polling.StateError)
+			m.statusBar.SetErrorMessage(fmt.Sprintf("Failed to load theme '%s': %v", msg.ThemeName, err))
+			return m, nil
+		}
+
+		// Create new styles with the selected theme
+		m.styles = styles.NewStyles(theme)
+
+		// Preserve transient status bar state before rebuilding
+		previousState := m.statusBar.GetState()
+		previousWarning := m.statusBar.GetWarningMessage()
+
+		// Update all components with new styles
+		m.statusBar = components.NewStatusBar(m.styles)
+		m.statusBar.SetState(previousState)
+		if previousWarning != "" {
+			m.statusBar.SetWarningMessage(previousWarning)
+		}
+		m.statusBar.SetOrganization(m.config.Organization)
+		m.statusBar.SetScopes(displayScopes(m.client, m.config))
+		m.statusBar.SetWidth(m.width)
+
+		m.logo = components.NewLogo(m.styles)
+
+		m.helpModal = components.NewHelpModal(m.styles)
+		if m.isTabEnabled(TabAvailablePipelines) {
+			m.helpModal.AddSection("Pipeline definitions", []components.HelpBinding{
+				{Key: "/", Description: "Search names, paths, and projects"},
+				{Key: "enter", Description: "Open pipeline variables"},
+				{Key: "v", Description: "View history for the selected pipeline"},
+				{Key: "e", Description: "Edit branch or variable"},
+				{Key: "A / a", Description: "Save variable (secret option) / add for this run"},
+				{Key: "d", Description: "Reset override"},
+				{Key: "P", Description: "Add Azure DevOps project"},
+				{Key: "r", Description: "Queue pipeline with current overrides"},
+				{Key: "esc", Description: "Back"},
+			})
+		}
+		configureHelpTabs(m.helpModal, m.config, m.enabledTabs)
+		m.helpModal.SetVersionInfo(formatVersionInfo(m.currentVersion, m.commitHash))
+		m.helpModal.SetScopes(displayScopes(m.client, m.config))
+		if configPath, err := config.GetPath(); err == nil {
+			m.helpModal.SetConfigPath(configPath)
+		}
+		m.helpModal.SetSize(m.width, m.height)
+
+		m.errorModal = components.NewErrorModal(m.styles)
+		m.errorModal.SetSize(m.width, m.height)
+
+		// Update theme picker with new styles and current theme
+		availableThemes := styles.ListAvailableThemes()
+		m.themePicker = components.NewThemePicker(m.styles, availableThemes, msg.ThemeName)
+
+		// Recreate views with new styles.
+		m.pipelinesView = pipelines.NewModelWithAzureClient(m.client, m.metricsClient, m.styles)
+		m.definitionsView = pipelines.NewDefinitionsModel(m.metricsClient, m.styles)
+		m.pullRequestsView = pullrequests.NewModelWithStyles(m.client, m.styles)
+		m.workItemsView = workitems.NewModelWithStyles(m.client, m.styles)
+		// Re-style the metrics view in place rather than reconstructing it —
+		// recreating would erase its loaded snapshots, sprint selection and
+		// fetched rows, blanking the section on theme change.
+		m.metricsView.SetStyles(m.styles)
+		// notificationsView is recreated like pipelines/PR/WI rather than
+		// restyled in place like metrics. Its marker is re-supplied from
+		// m.client on every reconstruction, same as the other panes; any
+		// in-flight optimistic overrides are discarded here exactly as the
+		// feed itself is, which is consistent with the rest of this block —
+		// the poller simply repopulates both on its next fetch. m.config is
+		// re-supplied too so the reconstructed pane's own Fetch closure keeps
+		// deriving NotifOpts/filtering from the same config the rest of the app
+		// uses, rather than reverting to the nil-cfg fallback.
+		m.notificationsView = notifications.NewModelWithStyles(m.styles, notificationMarker(m.client), m.config)
+
+		// CRITICAL: Set window size for all views before they try to render
+		// Subtract border space (2 width for sides, 2 height for top/bottom borders)
+		if m.width > 0 && m.height > 0 {
+			m.footerRows = m.measureFooterHeight()
+			contentSize := m.contentViewSize()
+			m.pipelinesView, _ = m.pipelinesView.Update(contentSize)
+			m.definitionsView, _ = m.definitionsView.SetSize(contentSize.Width, contentSize.Height)
+			m.pullRequestsView, _ = m.pullRequestsView.Update(contentSize)
+			m.workItemsView, _ = m.workItemsView.Update(contentSize)
+			m.metricsView, _ = m.metricsView.Update(contentSize)
+			m.notificationsView, _ = m.notificationsView.Update(contentSize)
+		}
+
+		// Re-initialize views to fetch data again
+		cmds = append(cmds, m.pipelinesView.Init())
+		if m.isTabEnabled(TabAvailablePipelines) {
+			cmds = append(cmds, m.definitionsView.Init())
+		}
+		if m.activeTab == TabPullRequests {
+			cmds = append(cmds, m.pullRequestsView.Init())
+		}
+		if m.activeTab == TabWorkItems {
+			cmds = append(cmds, m.workItemsView.Init())
+		}
+		if m.activeTab == TabNotifications {
+			cmds = append(cmds, m.notificationsView.Init())
+		}
+		// The metrics view is re-styled in place (SetStyles above), not
+		// recreated, so it must NOT be re-initialized here — re-running its
+		// async fetch/snapshot load would blank the already-loaded trends data
+		// on theme change. The normal tab-activation path re-inits it when
+		// needed.
+
+		return m, tea.Batch(cmds...)
+
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.statusBar.SetWidth(msg.Width)
+		m.errorModal.SetSize(msg.Width, msg.Height)
+		m.helpModal.SetSize(msg.Width, msg.Height)
+		m.themePicker.SetSize(msg.Width, msg.Height)
+		// Measure actual footer height at current width
+		m.footerRows = m.measureFooterHeight()
+		contentSize := m.contentViewSize()
+		m.pipelinesView, _ = m.pipelinesView.Update(contentSize)
+		m.definitionsView, _ = m.definitionsView.SetSize(contentSize.Width, contentSize.Height)
+		m.pullRequestsView, _ = m.pullRequestsView.Update(contentSize)
+		m.workItemsView, _ = m.workItemsView.Update(contentSize)
+		m.metricsView, _ = m.metricsView.Update(contentSize)
+		m.notificationsView, _ = m.notificationsView.Update(contentSize)
+		return m, nil
+
+	case updateCheckMsg:
+		if msg.info != nil && msg.info.UpdateAvailable {
+			m.statusBar.SetUpdateMessage(
+				fmt.Sprintf("Update available: %s → %s", msg.info.CurrentVersion, msg.info.LatestVersion),
+			)
+		}
+		return m, nil
+
+	case notifications.MarkResultMsg:
+		// Routed unconditionally, NOT through the delegate-to-active-tab switch
+		// below. A `u`/`d` is issued from the notifications tab but its result
+		// lands one HTTP round trip later, and tab switching is handled earlier
+		// in this function and returns early — so pressing 2 while a mark is in
+		// flight is trivially reachable. Delegating by active tab would hand the
+		// result to the pull-requests pane, which discards it, leaving the
+		// optimistic override as the sole holder of the mark and re-opening
+		// the resurrection defect by a second route: 30s later any re-derivation
+		// brings back a row the server already accepted as done.
+		//
+		// polling.PipelineRunsUpdated below is the same shape — a pane-bound
+		// message whose arrival is uncorrelated with which tab is showing.
+		var markCmd tea.Cmd
+		m.notificationsView, markCmd = m.notificationsView.Update(msg)
+		if markCmd != nil {
+			cmds = append(cmds, markCmd)
+		}
+		// A failed `u`/`d` sets the pane's statusMessage (closing a silent
+		// rollback); a success clears it. syncNotificationsActionMessage is the
+		// one place that surfacing is implemented — mirror it here exactly as
+		// NotificationsFetchedMsg below does, rather than reading
+		// m.notificationsView.GetStatusMessage() directly.
+		m.syncNotificationsActionMessage()
+		// The mark can flip the unread badge (a success clears it; a
+		// failure rolls the optimistic override back, re-raising it), and
+		// the badge is rendered from every tab regardless of which one is
+		// active. Re-measure here — same as NotificationsFetchedMsg below —
+		// so m.footerRows does not go stale relative to the badge's new
+		// digit width. Must come after syncNotificationsActionMessage, not
+		// before: the status message can itself add a wrapped footer row,
+		// and resizeActiveViewIfNeeded needs the status bar's fields settled
+		// first.
+		m.resizeActiveViewIfNeeded()
+		return m, tea.Batch(cmds...)
+
+	case polling.TickMsg:
+		// Time to poll for updates
+		cmds = append(cmds, m.poller.OnTick())
+
+	case polling.NotificationsTickMsg:
+		// A distinct top-level case from polling.TickMsg above:
+		// NotificationsTickMsg is a genuinely different concrete type, not
+		// TickMsg discriminated by a field, because the case above would
+		// still match a shared type and silently drive the pipeline poller
+		// instead of this one.
+		cmds = append(cmds, m.notificationsPoller.OnTick())
+
+	case polling.NotificationsFetchedMsg:
+		// Routed unconditionally, NOT through the delegate-to-active-tab
+		// switch below, for the same reason as notifications.MarkResultMsg
+		// and polling.PipelineRunsUpdated above: a background poll's result
+		// is uncorrelated with which tab is currently showing, and the
+		// notifications pane must still receive it (and re-derive its own
+		// polling cadence) even while some other tab is active.
+		//
+		// A nil Items with a nil Err means the inbox is genuinely EMPTY, and
+		// must clear the feed. It does not mean "nothing changed":
+		// CompositeProvider.List accumulates into a nil `var all []Notification`
+		// and mergeNotifications returns it untouched when no backend errored,
+		// so zero notifications is exactly this shape. "Not modified" never
+		// reaches this layer as nil — the GitHub client answers a 304 by
+		// replaying cloneThreads(c.cached) (notifications.go's "a 304 must never
+		// be read as 'the inbox is now empty'"), and an unsolicited 304 with no
+		// matching cache is an error. A skipped fetch emits no message at all,
+		// since FetchNotifications returns a nil tea.Cmd. So there is no shape
+		// left for a guard to catch, and guarding here strands a cleared inbox
+		// on screen forever.
+		filtered := notifications.FilterNotifications(msg.Items, m.config)
+		m.notificationsView = m.notificationsView.HandleFetchResult(filtered, msg.Err)
+		// HandleFetchResult clears the pane's own statusMessage on every
+		// fetch, success or failure alike (a stale `o` outcome must not
+		// survive "a poll refreshed the feed" — the reviewer-cited scenario
+		// this clearing rule specifically closes). Mirror that onto the
+		// status bar here, before this handler's own resizeActiveViewIfNeeded
+		// call below, so a footer that had widened for a long `o` failure
+		// message shrinks back and gets re-measured in the same render this
+		// fetch produces, not one render late.
+		m.syncNotificationsActionMessage()
+		// Re-derive the cadence after every fetch, success or failure alike: a
+		// GitHub hint only becomes known once the adapter has actually observed
+		// a response's X-Poll-Interval header, so the very first fetch is what
+		// turns a 0 hint into a real one.
+		m.notificationsPoller.SetInterval(notificationsPollInterval(m.client, m.config))
+		// NotifOpts must be re-derived once per fetch, not frozen at poller
+		// construction: since_days is computed from time.Now() at derivation
+		// time, so a poller that only ever got its opts once at startup would
+		// silently fetch an ever-staler window as real time passes.
+		m.notificationsPoller.SetOpts(notifications.NotifOptsFromConfig(m.config))
+		// A background poll can change the unread count, which changes the
+		// footer's badge digit width — and unlike every other status-bar
+		// field, the badge is driven by this poller, not by a following
+		// keypress, so there is no other point in the control flow that
+		// will ever repair m.footerRows if it goes stale here. Re-measure
+		// and resize before returning, the same as the delegate-to-active-
+		// tab path below does for every other message.
+		m.resizeActiveViewIfNeeded()
+		return m, tea.Batch(cmds...)
+
+	case components.CriticalErrorMsg:
+		m.errorModal.SetSize(m.width, m.height)
+		m.errorModal.Show(msg.Title, msg.Message, msg.Hint)
+		return m, nil
+
+	case polling.PipelineRunsUpdated:
+		// Process the update through error handler
+		runs, hasError := m.errorHandler.ProcessUpdate(msg)
+
+		if hasError {
+			m.statusBar.SetState(polling.StateError)
+			// Check if this is a critical error that should show the modal
+			if errInfo := components.ClassifyError(msg.Err); errInfo != nil {
+				m.errorModal.SetSize(m.width, m.height)
+				m.errorModal.Show(errInfo.Title, errInfo.Message, errInfo.Hint)
+			}
+			// Display user-friendly error message in status bar too
+			if m.errorHandler.ShouldShowError() {
+				m.statusBar.SetErrorMessage(m.errorHandler.RecoveryMessage())
+			}
+		} else {
+			m.statusBar.SetState(polling.StateConnected)
+			m.statusBar.ClearErrorMessage()
+
+			// Check for partial project load warning
+			if warning := m.errorHandler.PartialWarning(); warning != "" {
+				m.statusBar.SetWarningMessage(warning)
+			} else {
+				m.statusBar.ClearWarningMessage()
+			}
+		}
+
+		// Update pipelines view with the runs. The poller already returns neutral
+		// provider.PipelineRun values fanned out across all backends.
+		if runs != nil {
+			pipelineMsg := pipelines.SetRunsMsg{Runs: runs}
+			var cmd tea.Cmd
+			m.pipelinesView, cmd = m.pipelinesView.Update(pipelineMsg)
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
+	}
+
+	// Delegate to active view
+	var cmd tea.Cmd
+	switch m.activeTab {
+	case TabNotifications:
+		m.notificationsView, cmd = m.notificationsView.Update(msg)
+		// Covers both of `o`'s message-producing paths: the synchronous
+		// empty-WebURL case (set inline by this very Update call, no tea.Cmd
+		// involved) and the async openURLResultMsg success/failure case
+		// (delivered here on a later call, since that message is
+		// deliberately routed like any other — see its own doc comment).
+		// The re-measure this needs is covered by this switch's shared
+		// resizeActiveViewIfNeeded call just below, which runs for every
+		// message that reaches this path regardless of tab.
+		m.syncNotificationsActionMessage()
+	case TabPullRequests:
+		m.pullRequestsView, cmd = m.pullRequestsView.Update(msg)
+	case TabWorkItems:
+		m.workItemsView, cmd = m.workItemsView.Update(msg)
+	case TabMetrics:
+		m.metricsView, cmd = m.metricsView.Update(msg)
+	case TabAvailablePipelines:
+		m.definitionsView, cmd = m.definitionsView.Update(msg)
+	default:
+		m.pipelinesView, cmd = m.pipelinesView.Update(msg)
+	}
+	if cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+
+	// Re-measure footer height after view update — if the view switched
+	// between list/detail mode, the footer height changes and we need to
+	// resize the active view to match.
+	m.resizeActiveViewIfNeeded()
+
+	// Persist any change to the currently open detail view (e.g. user
+	// pressed Enter on a row, or Esc to leave detail). No-op if the
+	// store isn't attached.
+	m.recordDetailState()
+
+	return m, tea.Batch(cmds...)
+}
+
+// isActiveViewSearching returns true if the currently active tab's view is in search mode.
+func (m Model) isActiveViewSearching() bool {
+	switch m.activeTab {
+	case TabNotifications:
+		return m.notificationsView.IsSearching()
+	case TabPipelines:
+		return m.pipelinesView.IsSearching()
+	case TabPullRequests:
+		return m.pullRequestsView.IsSearching()
+	case TabWorkItems:
+		return m.workItemsView.IsSearching()
+	case TabMetrics:
+		return m.metricsView.IsSearching()
+	case TabAvailablePipelines:
+		return m.definitionsView.IsSearching()
+	}
+	return false
+}
+
+// isActiveViewCapturingInput returns true when the active view is either in
+// search mode or has a modal picker open — in both cases global shortcuts
+// must yield so keystrokes land in the view's own input field.
+func (m Model) isActiveViewCapturingInput() bool {
+	if m.isActiveViewSearching() {
+		return true
+	}
+	switch m.activeTab {
+	case TabWorkItems:
+		return m.workItemsView.IsTagPickerVisible() ||
+			m.workItemsView.IsStatePickerVisible() ||
+			m.workItemsView.IsCreateFormVisible() ||
+			m.workItemsView.IsCommentFormVisible()
+	case TabPipelines:
+		return m.pipelinesView.IsStatusPickerVisible()
+	case TabMetrics:
+		return m.metricsView.IsTagPickerVisible()
+	case TabAvailablePipelines:
+		return m.definitionsView.IsSearching()
+	}
+	return false
+}
+
+// Note: Tab styles are now provided by the styles package and accessed via m.styles
+
+// contentViewSize returns the size available for content views inside the
+// bordered content box. It subtracts all chrome from the terminal height:
+// the tab bar (with its own border), the content box borders, and the footer.
+//
+// The "\n" joins between tabBar, contentBox, and footer in View() do not
+// consume extra lines — they only prevent adjacent components from merging
+// on the same line (e.g. "╰──╯╭──╮" becoming one line instead of two).
+func (m Model) contentViewSize() tea.WindowSizeMsg {
+	const minContentWidth = 20
+	const minContentHeight = 5
+
+	width := m.width - borderWidth
+	if width < minContentWidth {
+		width = minContentWidth
+	}
+
+	height := m.height - tabBarRows - boxBorderRows - m.footerRows
+	if height < minContentHeight {
+		height = minContentHeight
+	}
+
+	return tea.WindowSizeMsg{
+		Width:  width,
+		Height: height,
+	}
+}
+
+// resizeActiveViewIfNeeded re-measures the footer height and resizes
+// the active content view if it changed (e.g., after tab switch or
+// view mode change).
+func (m *Model) resizeActiveViewIfNeeded() {
+	// Sync context items on the status bar BEFORE measuring, so the
+	// footer height reflects the current view mode (list vs detail).
+	m.syncStatusBarContext()
+	newFooterRows := m.measureFooterHeight()
+	if newFooterRows == m.footerRows {
+		return
+	}
+	m.footerRows = newFooterRows
+	contentSize := m.contentViewSize()
+	switch m.activeTab {
+	case TabNotifications:
+		m.notificationsView, _ = m.notificationsView.Update(contentSize)
+	case TabPullRequests:
+		m.pullRequestsView, _ = m.pullRequestsView.Update(contentSize)
+	case TabWorkItems:
+		m.workItemsView, _ = m.workItemsView.Update(contentSize)
+	case TabMetrics:
+		m.metricsView, _ = m.metricsView.Update(contentSize)
+	case TabAvailablePipelines:
+		m.definitionsView, _ = m.definitionsView.SetSize(contentSize.Width, contentSize.Height)
+	default:
+		m.pipelinesView, _ = m.pipelinesView.Update(contentSize)
+	}
+}
+
+// keybindingsForTab returns the status bar keybindings string for the active
+// tab, or "" when hasContextBar is true (a context bar replaces the default
+// per-tab keybindings in detail views). Factored out of View()'s old inline
+// switch purely to give View() and any other caller a single place to get
+// this text, rather than for use during premeasurement: syncStatusBarContext
+// deliberately does NOT call this (see its own comment) because the status
+// bar's connection state, error/warning messages, and other message-driven
+// fields are themselves only ever updated by handlers that skip the resize
+// path (e.g. polling.PipelineRunsUpdated), so syncing keybindings alone
+// during premeasure would make the mismatch between "what's stale" and
+// "what's fresh" worse, not better, for tabs that carry no unread badge.
+func (m Model) keybindingsForTab(hasContextBar bool) string {
+	if hasContextBar {
+		return ""
+	}
+	switch m.activeTab {
+	case TabNotifications:
+		return m.notificationsKeybindings()
+	case TabPullRequests:
+		return m.pullRequestsKeybindings()
+	case TabWorkItems:
+		return m.workItemsKeybindings()
+	case TabPipelines:
+		return m.pipelinesKeybindings()
+	case TabMetrics:
+		return m.metricsKeybindings()
+	case TabAvailablePipelines:
+		return m.definitionsKeybindings()
+	default:
+		return ""
+	}
+}
+
+// filterLabelForTab returns the status bar filter-label text for the active
+// tab and whether it is active at all. Factored out of View()'s old inline
+// switch for the same reason as keybindingsForTab, and for the same reason
+// NOT called from syncStatusBarContext: see that function's comment. There
+// is exactly one caller today (View()); this stays a separate function
+// rather than being inlined there because it pairs with keybindingsForTab,
+// and both exist to give a future caller (e.g. a premeasurement path that
+// gains a real need for the filter label) a single place to get this text.
+func (m Model) filterLabelForTab() (label string, active bool) {
+	switch m.activeTab {
+	case TabWorkItems:
+		var labels []string
+		if m.workItemsView.IsMyItemsActive() {
+			labels = append(labels, "My Items")
+		}
+		if m.workItemsView.IsTagFilterActive() {
+			labels = append(labels, "Tag: "+m.workItemsView.ActiveTag())
+		}
+		if m.workItemsView.IsStateFilterActive() {
+			labels = append(labels, "State: "+m.workItemsView.ActiveState())
+		}
+		if len(labels) > 0 {
+			return strings.Join(labels, " + "), true
+		}
+		return "", false
+	case TabPipelines:
+		if m.pipelinesView.IsStatusFilterActive() {
+			return "Status: " + m.pipelinesView.ActiveStatus(), true
+		}
+		return "", false
+	case TabPullRequests:
+		switch {
+		case m.pullRequestsView.IsMyPRsActive():
+			return "My PRs", true
+		case m.pullRequestsView.IsAsReviewerActive():
+			return "Reviewer", true
+		default:
+			return "", false
+		}
+	case TabMetrics:
+		if m.metricsView.IsTagFilterActive() {
+			return "Tag: " + m.metricsView.ActiveTag(), true
+		}
+		return "", false
+	case TabAvailablePipelines:
+		return "", false
+	default:
+		return "", false
+	}
+}
+
+// syncStatusBarContext reads context items from the active view and updates
+// the status bar. This ensures measureFooterHeight uses the correct state
+// during Update, not stale state from the previous View call.
+//
+// Deliberately narrow in scope: it syncs only the unread badge and context
+// items, not keybindings or the filter label. Those
+// two are left for View() to set on the next real render. Syncing them here
+// too was tried and reverted: connection state, error and warning messages
+// are set directly by message handlers that skip this premeasurement path
+// entirely (e.g. polling.PipelineRunsUpdated returns before reaching
+// resizeActiveViewIfNeeded), so they can already be stale at premeasure time
+// independent of anything below. Making keybindings exactly right here while
+// leaving state/error/warning wrong does not fix that pre-existing gap — it
+// just trades the direction of the mismatch, and did so in a way that broke
+// TestModel_View_OutputHeightMatchesTerminal, a test with no notifications
+// pane in play at all.
+//
+// The unread badge is NOT exempt from this class of bug — it is in fact the
+// worst case: View() does resync the badge's displayed number fresh on every
+// render (below), but m.footerRows, which the badge's digit width feeds
+// into via measureFooterHeight, is only ever written by
+// resizeActiveViewIfNeeded. Every other status-bar field that can change
+// outside a render (connection state, error/warning messages) is at least
+// followed by a keypress that reaches the delegate-to-active-tab path and
+// repairs the accounting. The badge's producer, polling.NotificationsFetchedMsg,
+// is the one status-bar input driven purely by a background poll with no
+// following keypress to fix things up — so its handler (and
+// notifications.MarkResultMsg's, which can also flip the count) must call
+// resizeActiveViewIfNeeded directly rather than relying on this method alone.
+func (m *Model) syncStatusBarContext() {
+	// Keep the unread badge in sync too: it renders unconditionally from every
+	// tab, so measureFooterHeight must see its real value here, not whatever was
+	// left over from the previous tab's View() call.
+	if m.isTabEnabled(TabNotifications) {
+		m.statusBar.SetUnreadCount(m.notificationsView.UnreadCount())
+	} else {
+		m.statusBar.SetUnreadCount(0)
+	}
+
+	var hasContextBar bool
+	var contextItems []components.ContextItem
+
+	switch m.activeTab {
+	case TabNotifications:
+		hasContextBar = m.notificationsView.HasContextBar()
+		contextItems = m.notificationsView.GetContextItems()
+	case TabPullRequests:
+		hasContextBar = m.pullRequestsView.HasContextBar()
+		contextItems = m.pullRequestsView.GetContextItems()
+	case TabWorkItems:
+		hasContextBar = m.workItemsView.HasContextBar()
+		contextItems = m.workItemsView.GetContextItems()
+	case TabMetrics:
+		hasContextBar = m.metricsView.HasContextBar()
+		contextItems = m.metricsView.GetContextItems()
+	case TabAvailablePipelines:
+		hasContextBar = m.definitionsView.HasContextBar()
+		contextItems = m.definitionsView.GetContextItems()
+	default:
+		hasContextBar = m.pipelinesView.HasContextBar()
+		contextItems = m.pipelinesView.GetContextItems()
+	}
+
+	if hasContextBar {
+		m.statusBar.SetContextItems(contextItems)
+	} else {
+		m.statusBar.ClearContextItems()
+	}
+}
+
+// syncNotificationsActionMessage surfaces the notifications pane's own
+// status message (today set only by `o`) onto the shared status bar. This
+// closes a defect: View()'s ordinary path only calls SetContextStatus when
+// hasContextBar is true, and this pane's HasContextBar() is currently always
+// false (there is no detail view yet to attach a context bar to) — so
+// GetStatusMessage()'s text, including both of `o`'s failure outcomes, was
+// rendered nowhere at all.
+//
+// SetWarningMessage/ClearWarningMessage were chosen over
+// SetErrorMessage/ClearErrorMessage even though both are named in
+// StatusBar's own doc comments as the two surfaces that render
+// unconditionally: SetErrorMessage's condition in StatusBar.View() is
+// `s.errorMessage != "" && s.state == polling.StateError`, gated on the
+// pipeline poller's connection state, a condition an `o` outcome has no
+// bearing on — reusing it would trade one dead path for another that is
+// dead just as often in practice.
+//
+// Edge-triggered against notificationsActionMessage rather than writing
+// unconditionally: this method is called on every message reaching the
+// delegate-to-active-tab switch below while notifications is the active
+// tab, and also from polling.NotificationsFetchedMsg's handler — not only
+// right after an `o` press. warningMessage is a single, tab-agnostic field
+// also driven independently by polling.PipelineRunsUpdated's own
+// partial-project-load warning (Init() can also seed it at startup).
+// Writing to it on every call, regardless of whether the pane's own message
+// actually changed, would blow away that unrelated warning on the very next
+// arrow-key press on the notifications tab, long after the `o` outcome it
+// belongs to stopped being relevant — reproducing the same "shared field,
+// last write wins, wrong write clobbers the right one" hazard this method
+// exists to avoid, just one level up.
+//
+// That edge-triggering only guards the *set* direction, though: it stops
+// this method from re-asserting its own stale message over someone else's,
+// but does nothing to stop the clear branch from retracting someone else's
+// message outright. warningMessage has exactly one other writer today
+// (polling.PipelineRunsUpdated's partial-load warning), and an unconditional
+// ClearWarningMessage() here — reached the instant the pane's own message
+// goes back to "" on a fetch — deletes whatever that writer put there in
+// the meantime, even though this method never wrote it and has no way to
+// know it belongs to someone else without checking first. So the clear
+// branch reads the status bar back (GetWarningMessage(), the same read-back
+// ThemeSelectedMsg's handler already uses to carry warningMessage across a
+// statusBar rebuild) and only clears if what's showing still matches what
+// this method itself last wrote — retracting only its own message, leaving
+// any other writer's message alone to self-heal on its own next update.
+func (m *Model) syncNotificationsActionMessage() {
+	msg := m.notificationsView.GetStatusMessage()
+	if msg == m.notificationsActionMessage {
+		return
+	}
+	prev := m.notificationsActionMessage
+	m.notificationsActionMessage = msg
+	if msg != "" {
+		m.statusBar.SetWarningMessage(msg)
+		return
+	}
+	// Retract only our own message (see doc comment above) — clearing
+	// unconditionally would delete whatever polling.PipelineRunsUpdated's
+	// partial-load warning wrote in the meantime.
+	if m.statusBar.GetWarningMessage() == prev {
+		m.statusBar.ClearWarningMessage()
+	}
+}
+
+// workItemsKeybindings returns the keybindings string for the work items list view.
+func (m Model) workItemsKeybindings() string {
+	sepStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(m.styles.Theme.Border))
+	sep := sepStyle.Render(" • ")
+
+	bindings := []string{
+		m.styles.Key.Render("r") + m.styles.Description.Render(" refresh"),
+		m.styles.Key.Render("↑↓") + m.styles.Description.Render(" navigate"),
+		m.styles.Key.Render("enter") + m.styles.Description.Render(" details"),
+	}
+	if m.workItemsView.CanCreateWorkItems() {
+		bindings = append(bindings, m.styles.Key.Render("n")+m.styles.Description.Render(" new work item"))
+	}
+	bindings = append(bindings,
+		m.styles.Key.Render("f")+m.styles.Description.Render(" search"),
+		m.styles.Key.Render("m")+m.styles.Description.Render(" my items"),
+		m.styles.Key.Render("T")+m.styles.Description.Render(" tags"),
+		m.styles.Key.Render("s")+m.styles.Description.Render(" state"),
+		m.styles.Key.Render("esc")+m.styles.Description.Render(" back"),
+		m.styles.Key.Render("?")+m.styles.Description.Render(" help"),
+		m.styles.Key.Render("q")+m.styles.Description.Render(" quit"),
+	)
+	return strings.Join(bindings, sep)
+}
+
+// pullRequestsKeybindings returns the keybindings string for the PR list view.
+func (m Model) pullRequestsKeybindings() string {
+	sepStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(m.styles.Theme.Border))
+	sep := sepStyle.Render(" • ")
+
+	bindings := []string{
+		m.styles.Key.Render("r") + m.styles.Description.Render(" refresh"),
+		m.styles.Key.Render("↑↓") + m.styles.Description.Render(" navigate"),
+		m.styles.Key.Render("enter") + m.styles.Description.Render(" details"),
+	}
+	if m.pullRequestsView.CanCreatePR() {
+		bindings = append(bindings, m.styles.Key.Render("n")+m.styles.Description.Render(" new PR"))
+	}
+	bindings = append(bindings,
+		m.styles.Key.Render("f")+m.styles.Description.Render(" search"),
+		m.styles.Key.Render("m")+m.styles.Description.Render(" my PRs"),
+		m.styles.Key.Render("A")+m.styles.Description.Render(" as reviewer"),
+		m.styles.Key.Render("esc")+m.styles.Description.Render(" back"),
+		m.styles.Key.Render("?")+m.styles.Description.Render(" help"),
+		m.styles.Key.Render("q")+m.styles.Description.Render(" quit"),
+	)
+	return strings.Join(bindings, sep)
+}
+
+// metricsKeybindings returns the keybindings string for the metrics dashboard.
+func (m Model) metricsKeybindings() string {
+	sepStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(m.styles.Theme.Border))
+	sep := sepStyle.Render(" • ")
+
+	return m.styles.Key.Render("r") + m.styles.Description.Render(" refresh") + sep +
+		m.styles.Key.Render("v") + m.styles.Description.Render(" live/trends") + sep +
+		m.styles.Key.Render("Tab") + m.styles.Description.Render(" focus pane") + sep +
+		m.styles.Key.Render("↑↓") + m.styles.Description.Render(" navigate") + sep +
+		m.styles.Key.Render("T") + m.styles.Description.Render(" tag") + sep +
+		m.styles.Key.Render("f") + m.styles.Description.Render(" flag filter") + sep +
+		m.styles.Key.Render("o") + m.styles.Description.Render(" open") + sep +
+		m.styles.Key.Render("esc") + m.styles.Description.Render(" clear tag") + sep +
+		m.styles.Key.Render("?") + m.styles.Description.Render(" help") + sep +
+		m.styles.Key.Render("q") + m.styles.Description.Render(" quit")
+}
+
+// pipelinesKeybindings returns the keybindings string for the pipelines list view.
+func (m Model) pipelinesKeybindings() string {
+	sepStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(m.styles.Theme.Border))
+	sep := sepStyle.Render(" • ")
+
+	return m.styles.Key.Render("r") + m.styles.Description.Render(" refresh") + sep +
+		m.styles.Key.Render("↑↓") + m.styles.Description.Render(" navigate") + sep +
+		m.styles.Key.Render("enter") + m.styles.Description.Render(" details") + sep +
+		m.styles.Key.Render("f") + m.styles.Description.Render(" search") + sep +
+		m.styles.Key.Render("S") + m.styles.Description.Render(" status") + sep +
+		m.styles.Key.Render("esc") + m.styles.Description.Render(" back") + sep +
+		m.styles.Key.Render("?") + m.styles.Description.Render(" help") + sep +
+		m.styles.Key.Render("q") + m.styles.Description.Render(" quit")
+}
+
+func (m Model) definitionsKeybindings() string {
+	sepStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(m.styles.Theme.Border))
+	sep := sepStyle.Render(" • ")
+
+	bindings := m.styles.Key.Render("↑↓/j/k") + m.styles.Description.Render(" navigate") + sep +
+		m.styles.Key.Render("/") + m.styles.Description.Render(" search") + sep +
+		m.styles.Key.Render("v") + m.styles.Description.Render(" run history") + sep +
+		m.styles.Key.Render("enter") + m.styles.Description.Render(" open") + sep +
+		m.styles.Key.Render("r") + m.styles.Description.Render(" refresh") + sep +
+		m.styles.Key.Render("esc") + m.styles.Description.Render(" back") + sep +
+		m.styles.Key.Render("?") + m.styles.Description.Render(" help") + sep +
+		m.styles.Key.Render("q") + m.styles.Description.Render(" quit")
+	if m.definitionsView.IsShowingDefinitionList() && !m.definitionsView.IsSearching() {
+		bindings += sep + m.styles.Key.Render("P") + m.styles.Description.Render(" add project")
+	}
+	return bindings
+}
+
+func (m *Model) openAddProjectModal() {
+	m.addProjectInput.SetValue("")
+	m.addProjectError = ""
+	m.addProjectSaved = false
+	m.addProjectVisible = true
+	m.addProjectInput.Width = max(20, min(60, m.width-12))
+}
+
+func (m *Model) closeAddProjectModal() {
+	m.addProjectVisible = false
+	m.addProjectInput.Blur()
+}
+
+func (m *Model) saveAzureProject(project string) error {
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return fmt.Errorf("project name cannot be empty")
+	}
+	if m.config == nil || !m.config.HasAzure() {
+		return fmt.Errorf("Azure DevOps is not configured")
+	}
+	for _, existing := range m.config.Projects {
+		if strings.EqualFold(strings.TrimSpace(existing), project) {
+			return fmt.Errorf("project %q is already configured", project)
+		}
+	}
+
+	updated := *m.config
+	updated.Projects = append(slices.Clone(m.config.Projects), project)
+	if err := updated.Save(); err != nil {
+		return fmt.Errorf("failed to save project configuration: %w", err)
+	}
+	return nil
+}
+
+func (m Model) addProjectModalView() string {
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(m.styles.Theme.Primary)).Render("Add Azure DevOps project")
+	body := ""
+	if m.addProjectSaved {
+		body = "Project saved to configuration.\nRestart Hazdo to load its pipelines.\n\nPress Esc to close."
+	} else {
+		body = "Enter the exact project name from Azure DevOps:\n\n" + m.addProjectInput.View()
+		if m.addProjectError != "" {
+			body += "\n\n" + lipgloss.NewStyle().Foreground(lipgloss.Color(m.styles.Theme.Error)).Render(m.addProjectError)
+		}
+		body += "\n\nEnter to save  •  Esc to cancel"
+	}
+	modal := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(m.styles.Theme.Border)).
+		Padding(1, 2).
+		Width(min(72, max(30, m.width-4))).
+		Render(title + "\n\n" + body)
+	if m.width > 0 && m.height > 0 {
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal)
+	}
+	return modal
+}
+
+// notificationsKeybindings returns the keybindings string for the
+// notifications list view: navigation, `f` filter, `r` refresh, the `u`/`d`
+// mark-read/mark-done triage keys, and `o` (open the selected row's WebURL in
+// the browser).
+func (m Model) notificationsKeybindings() string {
+	sepStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(m.styles.Theme.Border))
+	sep := sepStyle.Render(" • ")
+
+	return m.styles.Key.Render("↑↓") + m.styles.Description.Render(" navigate") + sep +
+		m.styles.Key.Render("f") + m.styles.Description.Render(" filter reason") + sep +
+		m.styles.Key.Render("u") + m.styles.Description.Render(" mark read") + sep +
+		m.styles.Key.Render("d") + m.styles.Description.Render(" mark done") + sep +
+		m.styles.Key.Render("o") + m.styles.Description.Render(" open") + sep +
+		m.styles.Key.Render("r") + m.styles.Description.Render(" refresh") + sep +
+		m.styles.Key.Render("?") + m.styles.Description.Render(" help") + sep +
+		m.styles.Key.Render("q") + m.styles.Description.Render(" quit")
+}
+
+// notificationsWarningsBanner renders Config.Warnings ahead of the
+// notifications pane's own render state. internal/config populates this slice
+// at load time — currently an unrecognised exclude_reasons entry, a
+// malformed exclude_repos/include_repos glob, only_configured_repos
+// overriding a non-empty include_repos, and lookback_days being clamped to
+// AzureLookbackDaysMax (see Config.Warnings' own doc comment for the
+// authoritative list) — and never prints it itself — a TUI has no safe place
+// to write a line before or after Bubble Tea's alt-screen switch — so this is
+// the one delivery route. Returns "" for an empty (or nil) slice so an
+// unpopulated Warnings field never reserves a blank line ahead of the pane's
+// content; see notificationsTabContent, which is what actually enforces that.
+func notificationsWarningsBanner(warnings []string) string {
+	if len(warnings) == 0 {
+		return ""
+	}
+	return strings.Join(warnings, "\n")
+}
+
+// notificationsTabContent composes the notifications tab's full content:
+// notificationsWarningsBanner's banner (when non-empty) ahead of the pane's
+// own render. Factored out of View() as a pure function so the "an empty
+// Warnings slice must not reserve a blank line" requirement is assertable
+// directly against a plain string, without m.styles.ContentBox's Render()
+// reformatting it first — a version that unconditionally prepends
+// banner+"\n\n" would leave a stray leading blank line in front of paneView
+// whenever warnings is empty, which this shape cannot produce.
+func notificationsTabContent(paneView string, warnings []string) string {
+	banner := notificationsWarningsBanner(warnings)
+	if banner == "" {
+		return paneView
+	}
+	return banner + "\n\n" + paneView
+}
+
+// measureFooterHeight measures the actual footer height. The footer is always
+// just the status bar (context items are now rendered inline in the status bar).
+func (m Model) measureFooterHeight() int {
+	return strings.Count(m.statusBar.View(), "\n") + 1
+}
+
+// renderTabBar renders the tab header content wrapped in its own bordered box,
+// with tabs on the left and the ASCII art logo on the right.
+func (m Model) renderTabBar(innerWidth int) string {
+	var renderedTabs []string
+	for i, tab := range m.enabledTabs {
+		label := fmt.Sprintf("%d: %s", i+1, m.tabName(tab))
+		if tab == m.activeTab {
+			renderedTabs = append(renderedTabs, m.styles.TabActive.Render(label))
+		} else {
+			renderedTabs = append(renderedTabs, m.styles.TabInactive.Render(label))
+		}
+	}
+
+	tabs := strings.Join(renderedTabs, " ")
+	logo := m.logo.View()
+
+	// Place tabs on the left (top-aligned) and logo on the right.
+	logoWidth := lipgloss.Width(logo)
+	tabsWidth := innerWidth - logoWidth
+	if tabsWidth < 0 {
+		tabsWidth = 0
+	}
+
+	left := lipgloss.NewStyle().
+		Width(tabsWidth).
+		Height(m.logo.Height()).
+		AlignVertical(lipgloss.Center).
+		Render(tabs)
+
+	content := lipgloss.JoinHorizontal(lipgloss.Top, left, logo)
+
+	return m.styles.TabBar.Width(innerWidth).Render(content)
+}
+
+func (m Model) tabName(tab Tab) string {
+	if tab == TabAvailablePipelines {
+		return "All Pipelines"
+	}
+	if m.config == nil {
+		return ""
+	}
+	switch tab {
+	case TabNotifications:
+		return m.config.TermFor("notifications", "Notifications")
+	case TabPullRequests:
+		return m.config.TermFor("pull_requests", "Pull Requests")
+	case TabWorkItems:
+		return m.config.TermFor("work_items", "Work Items")
+	case TabPipelines:
+		return m.config.TermFor("pipelines", "Active Pipelines")
+	case TabMetrics:
+		return m.config.TermFor("metrics", "Metrics")
+	default:
+		return ""
+	}
+}
+
+func (m Model) tabAtPosition(x, y int) (Tab, bool) {
+	if y <= 0 || y >= tabBarRows-1 {
+		return 0, false
+	}
+
+	tabX := 1 // The tab bar's left border.
+	for i, tab := range m.enabledTabs {
+		label := fmt.Sprintf("%d: %s", i+1, m.tabName(tab))
+		style := m.styles.TabInactive
+		if tab == m.activeTab {
+			style = m.styles.TabActive
+		}
+		tabWidth := lipgloss.Width(style.Render(label))
+		if x >= tabX && x < tabX+tabWidth {
+			return tab, true
+		}
+		tabX += tabWidth + 1
+	}
+	return 0, false
+}
+
+func (m Model) mouseContentYOffset() int {
+	switch m.activeTab {
+	case TabAvailablePipelines:
+		if m.definitionsView.IsShowingRunHistoryList() {
+			return tabBarRows + 3
+		}
+		if m.definitionsView.IsShowingDefinitionList() {
+			return tabBarRows + 2
+		}
+	case TabPipelines:
+		if m.pipelinesView.GetViewMode() == pipelines.ViewList {
+			return tabBarRows + 2
+		}
+	case TabPullRequests:
+		if m.pullRequestsView.GetViewMode() == pullrequests.ViewList {
+			return tabBarRows + 2
+		}
+	case TabWorkItems:
+		if m.workItemsView.GetViewMode() == workitems.ViewList {
+			return tabBarRows + 2
+		}
+	}
+	return 0
+}
+
+// View renders the application UI
+func (m Model) View() string {
+	if m.err != nil {
+		return "Error: " + m.err.Error() + "\n\nPress q to quit."
+	}
+
+	// If error modal is visible, show it as overlay
+	if m.errorModal.IsVisible() {
+		return m.errorModal.View()
+	}
+
+	if m.addProjectVisible {
+		return m.addProjectModalView()
+	}
+
+	// If help modal is visible, show it as overlay
+	if m.helpModal.IsVisible() {
+		return m.helpModal.View()
+	}
+
+	// If theme picker is visible, show it as overlay
+	if m.themePicker.IsVisible() {
+		return m.themePicker.View()
+	}
+
+	// If tag picker is visible, show it as overlay
+	if m.activeTab == TabWorkItems && m.workItemsView.IsTagPickerVisible() {
+		m.workItemsView.SetTagPickerSize(m.width, m.height)
+		return m.workItemsView.TagPickerView()
+	}
+
+	// If state picker is visible, show it as overlay
+	if m.activeTab == TabWorkItems && m.workItemsView.IsStatePickerVisible() {
+		m.workItemsView.SetStatePickerSize(m.width, m.height)
+		return m.workItemsView.StatePickerView()
+	}
+
+	if m.activeTab == TabWorkItems && m.workItemsView.IsCreateFormVisible() {
+		m.workItemsView.SetCreateFormSize(m.width, m.height)
+		return m.workItemsView.CreateFormView()
+	}
+
+	// If status picker is visible, show it as overlay
+	if m.activeTab == TabPipelines && m.pipelinesView.IsStatusPickerVisible() {
+		m.pipelinesView.SetStatusPickerSize(m.width, m.height)
+		return m.pipelinesView.StatusPickerView()
+	}
+
+	// Metrics tag picker overlay
+	if m.activeTab == TabMetrics && m.metricsView.IsTagPickerVisible() {
+		m.metricsView.SetTagPickerSize(m.width, m.height)
+		return m.metricsView.TagPickerView()
+	}
+
+	// Render tab bar in its own bordered box
+	contentSize := m.contentViewSize()
+	tabBar := m.renderTabBar(contentSize.Width)
+
+	// Render content based on active tab
+	var content string
+	var hasContextBar bool
+	var scrollPercent float64
+	var statusMessage string
+
+	switch m.activeTab {
+	case TabNotifications:
+		content = notificationsTabContent(m.notificationsView.View(), m.config.Warnings)
+		hasContextBar = m.notificationsView.HasContextBar()
+		scrollPercent = m.notificationsView.GetScrollPercent()
+		statusMessage = m.notificationsView.GetStatusMessage()
+	case TabPullRequests:
+		content = m.pullRequestsView.View()
+		hasContextBar = m.pullRequestsView.HasContextBar()
+		scrollPercent = m.pullRequestsView.GetScrollPercent()
+		statusMessage = m.pullRequestsView.GetStatusMessage()
+	case TabWorkItems:
+		content = m.workItemsView.View()
+		hasContextBar = m.workItemsView.HasContextBar()
+		scrollPercent = m.workItemsView.GetScrollPercent()
+		statusMessage = m.workItemsView.GetStatusMessage()
+	case TabMetrics:
+		content = m.metricsView.View()
+		hasContextBar = m.metricsView.HasContextBar()
+		scrollPercent = m.metricsView.GetScrollPercent()
+		statusMessage = m.metricsView.GetStatusMessage()
+	case TabAvailablePipelines:
+		content = m.definitionsView.View()
+		hasContextBar = m.definitionsView.HasContextBar()
+		scrollPercent = m.definitionsView.GetScrollPercent()
+		statusMessage = m.definitionsView.GetStatusMessage()
+	default:
+		content = m.pipelinesView.View()
+		hasContextBar = m.pipelinesView.HasContextBar()
+		scrollPercent = m.pipelinesView.GetScrollPercent()
+		statusMessage = m.pipelinesView.GetStatusMessage()
+	}
+
+	// Sync the unread badge and context items on the status bar through the
+	// same syncStatusBarContext that resizeActiveViewIfNeeded uses to
+	// premeasure the footer height, so those two never disagree about the
+	// badge or context items. Keybindings and the filter label are set
+	// separately just below, through the same keybindingsForTab/
+	// filterLabelForTab helpers, but NOT via syncStatusBarContext — see that
+	// method's comment for why.
+	m.syncStatusBarContext()
+
+	// Context status (detail-view status message) is set here rather than in
+	// syncStatusBarContext because it depends on statusMessage, which is only
+	// available once the active view's content has actually been rendered
+	// above.
+	if hasContextBar && statusMessage != "" {
+		m.statusBar.SetContextStatus(statusMessage)
+	}
+
+	m.statusBar.SetKeybindings(m.keybindingsForTab(hasContextBar))
+
+	if label, active := m.filterLabelForTab(); active {
+		m.statusBar.SetFilterLabel(label)
+	} else {
+		m.statusBar.ClearFilterLabel()
+	}
+
+	// Pass scroll percent to status bar
+	if scrollPercent > 0 {
+		m.statusBar.ShowScrollPercent(true)
+		m.statusBar.SetScrollPercent(scrollPercent)
+	} else {
+		m.statusBar.ShowScrollPercent(false)
+	}
+
+	footer := m.statusBar.View()
+
+	// Render content in its own bordered box, using the same dimensions
+	// that were used to size the content views.
+	contentBox := m.styles.ContentBox.
+		Width(contentSize.Width).
+		Height(contentSize.Height).
+		Render(content)
+
+	return tabBar + "\n" + contentBox + "\n" + footer
+}

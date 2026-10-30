@@ -1,0 +1,1739 @@
+package pipelines
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/hari-incoming/hazdo/internal/provider"
+	"github.com/hari-incoming/hazdo/internal/ui/styles"
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+func TestDetailModel_ViewportUsesFullAvailableHeight(t *testing.T) {
+	// The height passed to SetSize is already the content area (after app-level
+	// borders and footer are subtracted). The detail view should only subtract
+	// its own header lines (title + separator = 2 lines).
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "1", DefinitionName: "Build"}
+	model := NewDetailModel(nil, run)
+
+	height := 30
+	model.SetSize(80, height)
+
+	// Create enough items to fill the viewport
+	records := make([]provider.TimelineRecord, 50)
+	for i := range records {
+		records[i] = provider.TimelineRecord{
+			ID: fmt.Sprintf("task-%d", i), ParentID: "",
+			Type: "Task", Name: fmt.Sprintf("Task %d", i), Order: i,
+		}
+	}
+	model.SetTimeline(&provider.Timeline{Identity: provider.Identity{ID: "test", Scope: "proj"}, Records: records})
+
+	view := model.View()
+	lines := strings.Split(view, "\n")
+
+	// The view output should use the full height passed in.
+	// Header = 2 lines, viewport = height - 2 lines.
+	// Total output lines should equal height.
+	if len(lines) != height {
+		t.Errorf("Detail view output has %d lines, want %d (height passed to SetSize). "+
+			"Viewport is not using full available height.", len(lines), height)
+	}
+}
+
+func TestRecordIconWithStyles(t *testing.T) {
+	themes := []string{"dark", "gruvbox", "nord", "dracula"}
+
+	for _, themeName := range themes {
+		t.Run(themeName, func(t *testing.T) {
+			s := styles.NewStyles(styles.GetThemeByNameWithFallback(themeName))
+
+			tests := []struct {
+				state, result string
+				wantContains  string
+			}{
+				{"inprogress", "", "●"},
+				{"completed", "succeeded", "✓"},
+				{"completed", "failed", "✗"},
+				{"pending", "", "○"},
+			}
+
+			for _, tt := range tests {
+				got := recordIconWithStyles(tt.state, tt.result, s)
+				if !strings.Contains(got, tt.wantContains) {
+					t.Errorf("recordIconWithStyles(%q, %q) with theme %s = %q, want to contain %q",
+						tt.state, tt.result, themeName, got, tt.wantContains)
+				}
+			}
+		})
+	}
+}
+
+func TestDetailRecordIcon(t *testing.T) {
+	tests := []struct {
+		name         string
+		recordType   string
+		state        string
+		result       string
+		wantContains string
+	}{
+		// Stage icons
+		{
+			name:         "stage completed succeeded",
+			recordType:   "Stage",
+			state:        "completed",
+			result:       "succeeded",
+			wantContains: "✓",
+		},
+		{
+			name:         "stage in progress",
+			recordType:   "Stage",
+			state:        "inProgress",
+			result:       "",
+			wantContains: "●",
+		},
+		{
+			name:         "stage pending",
+			recordType:   "Stage",
+			state:        "pending",
+			result:       "",
+			wantContains: "○",
+		},
+
+		// Job icons
+		{
+			name:         "job completed failed",
+			recordType:   "Job",
+			state:        "completed",
+			result:       "failed",
+			wantContains: "✗",
+		},
+
+		// Task icons
+		{
+			name:         "task completed skipped",
+			recordType:   "Task",
+			state:        "completed",
+			result:       "skipped",
+			wantContains: "○",
+		},
+
+		// Additional result values
+		{
+			name:         "succeeded with issues",
+			recordType:   "Task",
+			state:        "completed",
+			result:       "succeededWithIssues",
+			wantContains: "◐",
+		},
+		{
+			name:         "canceled",
+			recordType:   "Task",
+			state:        "completed",
+			result:       "canceled",
+			wantContains: "○",
+		},
+		{
+			name:         "abandoned",
+			recordType:   "Task",
+			state:        "completed",
+			result:       "abandoned",
+			wantContains: "○",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := recordIconWithStyles(tt.state, tt.result, styles.DefaultStyles())
+			if !strings.Contains(got, tt.wantContains) {
+				t.Errorf("recordIconWithStyles(%q, %q) = %q, want to contain %q",
+					tt.state, tt.result, got, tt.wantContains)
+			}
+		})
+	}
+}
+
+func TestVisualDepthIndentation(t *testing.T) {
+	// Indentation is based on visual depth (2 spaces per level)
+	// not record type, so root-level Jobs get no indentation
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "phase-1", ParentID: "stage-1", Type: "Phase", Name: "Phase", Order: 1},
+			{ID: "job-1", ParentID: "phase-1", Type: "Job", Name: "Build Job", Order: 1},
+			{ID: "task-1", ParentID: "job-1", Type: "Task", Name: "npm install", Order: 1},
+			// Root-level Job (like Azure DevOps "Finalize build")
+			{ID: "finalize", ParentID: "", Type: "Job", Name: "Finalize build", Order: 2},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "1"}
+	model := NewDetailModel(nil, run)
+	model.SetTimeline(timeline)
+
+	// Expand everything to check depths
+	model.ToggleExpand() // expand Build stage
+	model.MoveDown()
+	model.ToggleExpand() // expand Build Job
+
+	// Visual depths: Build=0, Build Job=1, npm install=2, Finalize build=0
+	expected := []struct {
+		name  string
+		depth int
+	}{
+		{"Build", 0},
+		{"Build Job", 1},
+		{"npm install", 2},
+		{"Finalize build", 0},
+	}
+
+	if len(model.flatItems) != len(expected) {
+		t.Fatalf("Expected %d flat items, got %d", len(expected), len(model.flatItems))
+	}
+
+	for i, exp := range expected {
+		node := model.flatItems[i]
+		if node.Record.Name != exp.name {
+			t.Errorf("flatItems[%d].Name = %q, want %q", i, node.Record.Name, exp.name)
+		}
+		if node.VisualDepth != exp.depth {
+			t.Errorf("flatItems[%d] (%s) VisualDepth = %d, want %d", i, exp.name, node.VisualDepth, exp.depth)
+		}
+	}
+}
+
+func TestCollapseAndExpandAllTimelineNodes(t *testing.T) {
+	model := NewDetailModel(nil, provider.PipelineRun{DefinitionName: "Build"})
+	model.SetTimeline(&provider.Timeline{Records: []provider.TimelineRecord{
+		{ID: "stage", Type: "Stage", Name: "Build", Order: 1},
+		{ID: "job", ParentID: "stage", Type: "Job", Name: "Compile", Order: 1},
+		{ID: "task", ParentID: "job", Type: "Task", Name: "Go test", Order: 1},
+	}})
+
+	model.ToggleExpand()
+	model.MoveDown()
+	model.ToggleExpand()
+	if got := len(model.flatItems); got != 3 {
+		t.Fatalf("expanded timeline has %d visible records, want 3", got)
+	}
+
+	model, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	model, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'M'}})
+	if got := len(model.flatItems); got != 1 {
+		t.Fatalf("zM left %d visible records, want only the root", got)
+	}
+
+	model, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	model, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	if got := len(model.flatItems); got != 3 {
+		t.Fatalf("zR shows %d visible records, want 3", got)
+	}
+}
+
+func TestBuildTimelineTree(t *testing.T) {
+	// Create a sample timeline with nested structure
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test-timeline", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{
+				ID:       "stage-1",
+				ParentID: "",
+				Type:     "Stage",
+				Name:     "Build",
+				State:    "completed",
+				Result:   "succeeded",
+				Order:    1,
+			},
+			{
+				ID:       "job-1",
+				ParentID: "stage-1",
+				Type:     "Job",
+				Name:     "Build Job",
+				State:    "completed",
+				Result:   "succeeded",
+				Order:    1,
+			},
+			{
+				ID:       "task-1",
+				ParentID: "job-1",
+				Type:     "Task",
+				Name:     "npm install",
+				State:    "completed",
+				Result:   "succeeded",
+				Order:    1,
+			},
+			{
+				ID:       "task-2",
+				ParentID: "job-1",
+				Type:     "Task",
+				Name:     "npm build",
+				State:    "completed",
+				Result:   "succeeded",
+				Order:    2,
+			},
+			{
+				ID:       "stage-2",
+				ParentID: "",
+				Type:     "Stage",
+				Name:     "Test",
+				State:    "inProgress",
+				Result:   "",
+				Order:    2,
+			},
+		},
+	}
+
+	tree := buildTimelineTree(timeline)
+
+	// Should have 2 root stages
+	if len(tree) != 2 {
+		t.Fatalf("Expected 2 root nodes, got %d", len(tree))
+	}
+
+	// First stage should be "Build"
+	if tree[0].Record.Name != "Build" {
+		t.Errorf("First stage name = %q, want Build", tree[0].Record.Name)
+	}
+
+	// Build stage should have 1 child (job)
+	if len(tree[0].Children) != 1 {
+		t.Errorf("Build stage children = %d, want 1", len(tree[0].Children))
+	}
+
+	// Job should have 2 children (tasks)
+	if len(tree[0].Children[0].Children) != 2 {
+		t.Errorf("Build job children = %d, want 2", len(tree[0].Children[0].Children))
+	}
+
+	// Second stage should be "Test"
+	if tree[1].Record.Name != "Test" {
+		t.Errorf("Second stage name = %q, want Test", tree[1].Record.Name)
+	}
+}
+
+func TestFlattenTree(t *testing.T) {
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "job-1", ParentID: "stage-1", Type: "Job", Name: "Build Job", Order: 1},
+			{ID: "task-1", ParentID: "job-1", Type: "Task", Name: "npm install", Order: 1},
+			{ID: "stage-2", ParentID: "", Type: "Stage", Name: "Test", Order: 2},
+		},
+	}
+
+	tree := buildTimelineTree(timeline)
+
+	// Collapsed by default: only root stages visible
+	flat := flattenTree(tree)
+	if len(flat) != 2 {
+		t.Fatalf("Expected 2 flat items (collapsed), got %d", len(flat))
+	}
+	if flat[0].Record.Name != "Build" {
+		t.Errorf("flat[0].Name = %q, want Build", flat[0].Record.Name)
+	}
+	if flat[1].Record.Name != "Test" {
+		t.Errorf("flat[1].Name = %q, want Test", flat[1].Record.Name)
+	}
+
+	// Expand all nodes and verify full tree
+	var expandAll func(nodes []*TimelineNode)
+	expandAll = func(nodes []*TimelineNode) {
+		for _, n := range nodes {
+			n.Expanded = true
+			expandAll(n.Children)
+		}
+	}
+	expandAll(tree)
+
+	flat = flattenTree(tree)
+	if len(flat) != 4 {
+		t.Fatalf("Expected 4 flat items (expanded), got %d", len(flat))
+	}
+
+	expectedOrder := []string{"Build", "Build Job", "npm install", "Test"}
+	for i, item := range flat {
+		if item.Record.Name != expectedOrder[i] {
+			t.Errorf("flat[%d].Name = %q, want %q", i, item.Record.Name, expectedOrder[i])
+		}
+	}
+}
+
+func TestFormatDuration(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name       string
+		startTime  *time.Time
+		finishTime *time.Time
+		want       string
+	}{
+		{
+			name:       "no start time",
+			startTime:  nil,
+			finishTime: nil,
+			want:       "-",
+		},
+		{
+			name:       "in progress (no finish time)",
+			startTime:  timePtr(now.Add(-5 * time.Minute)),
+			finishTime: nil,
+			want:       "-",
+		},
+		{
+			name:       "completed 30 seconds",
+			startTime:  timePtr(now.Add(-30 * time.Second)),
+			finishTime: timePtr(now),
+			want:       "30s",
+		},
+		{
+			name:       "completed 2 minutes 30 seconds",
+			startTime:  timePtr(now.Add(-150 * time.Second)),
+			finishTime: timePtr(now),
+			want:       "2m30s",
+		},
+		{
+			name:       "completed 1 hour 5 minutes 30 seconds",
+			startTime:  timePtr(now.Add(-1*time.Hour - 5*time.Minute - 30*time.Second)),
+			finishTime: timePtr(now),
+			want:       "1h5m30s",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatRecordDuration(tt.startTime, tt.finishTime)
+			if got != tt.want {
+				t.Errorf("formatRecordDuration() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDetailModel_SelectedItem(t *testing.T) {
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "job-1", ParentID: "stage-1", Type: "Job", Name: "Build Job", Order: 1, LogID: 5},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModel(nil, run)
+	model.SetTimeline(timeline)
+
+	// Initial selection should be index 0
+	if model.SelectedIndex() != 0 {
+		t.Errorf("Initial SelectedIndex() = %d, want 0", model.SelectedIndex())
+	}
+
+	// Expand stage to reveal job
+	model.ToggleExpand()
+
+	// Move down to job
+	model.MoveDown()
+	if model.SelectedIndex() != 1 {
+		t.Errorf("After MoveDown, SelectedIndex() = %d, want 1", model.SelectedIndex())
+	}
+
+	// Selected item should have a log
+	selected := model.SelectedItem()
+	if selected == nil {
+		t.Fatal("SelectedItem() returned nil")
+	}
+	if selected.Record.LogID == 0 {
+		t.Error("Selected item should have a Log reference")
+	}
+	if selected.Record.LogID != 5 {
+		t.Errorf("Selected log ID = %d, want 5", selected.Record.LogID)
+	}
+}
+
+func TestDetailModel_ViewportScrolling(t *testing.T) {
+	// Create a timeline with many items to test scrolling
+	records := make([]provider.TimelineRecord, 50)
+	for i := 0; i < 50; i++ {
+		records[i] = provider.TimelineRecord{
+			ID:       fmt.Sprintf("task-%d", i),
+			ParentID: "",
+			Type:     "Task",
+			Name:     fmt.Sprintf("Task %d", i),
+			Order:    i,
+		}
+	}
+
+	timeline := &provider.Timeline{Identity: provider.Identity{ID: "test", Scope: "proj"}, Records: records}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModel(nil, run)
+	model.SetSize(80, 20) // Set a small height to trigger scrolling
+	model.SetTimeline(timeline)
+
+	// View should render without panic
+	view := model.View()
+	if view == "" {
+		t.Error("View should not be empty")
+	}
+
+	// Move down many times - selection should change
+	for i := 0; i < 30; i++ {
+		model.MoveDown()
+	}
+
+	if model.SelectedIndex() != 30 {
+		t.Errorf("After 30 MoveDown, SelectedIndex() = %d, want 30", model.SelectedIndex())
+	}
+
+	// View should still be renderable without panic
+	view = model.View()
+	if view == "" {
+		t.Error("View should not be empty after scrolling")
+	}
+
+	// Scroll percentage should be accessible via GetScrollPercent
+	percent := model.GetScrollPercent()
+	if percent < 0 || percent > 100 {
+		t.Errorf("GetScrollPercent() = %f, should be between 0 and 100", percent)
+	}
+}
+
+func TestDetailModel_PageUpDown(t *testing.T) {
+	// Create a timeline with many items
+	records := make([]provider.TimelineRecord, 50)
+	for i := 0; i < 50; i++ {
+		records[i] = provider.TimelineRecord{
+			ID:       fmt.Sprintf("task-%d", i),
+			ParentID: "",
+			Type:     "Task",
+			Name:     fmt.Sprintf("Task %d", i),
+			Order:    i,
+		}
+	}
+
+	timeline := &provider.Timeline{Identity: provider.Identity{ID: "test", Scope: "proj"}, Records: records}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModel(nil, run)
+	model.SetSize(80, 20) // viewport height = 20 - 2 (header) = 18
+	model.SetTimeline(timeline)
+
+	// Initial position should be 0
+	if model.SelectedIndex() != 0 {
+		t.Errorf("Initial SelectedIndex() = %d, want 0", model.SelectedIndex())
+	}
+
+	// PageDown should move selection by viewport height
+	model.PageDown()
+	// Should move roughly one page (viewport height is 14)
+	if model.SelectedIndex() < 10 {
+		t.Errorf("After PageDown, SelectedIndex() = %d, want >= 10", model.SelectedIndex())
+	}
+
+	prevIndex := model.SelectedIndex()
+
+	// PageUp should move selection back up
+	model.PageUp()
+	if model.SelectedIndex() >= prevIndex {
+		t.Errorf("After PageUp, SelectedIndex() = %d, should be less than %d", model.SelectedIndex(), prevIndex)
+	}
+}
+
+func TestDetailModel_StatusMessage(t *testing.T) {
+	// Create timeline with items that have and don't have logs
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build Stage", Order: 1},
+			{ID: "task-1", ParentID: "stage-1", Type: "Task", Name: "npm install", Order: 1, LogID: 5},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModel(nil, run)
+	model.SetSize(80, 20)
+	model.SetTimeline(timeline)
+
+	// Initially selected item (stage) has no log - status message should indicate this
+	if model.SelectedItem().Record.LogID != 0 {
+		t.Error("First item (stage) should not have a log")
+	}
+
+	// GetStatusMessage should indicate no logs available
+	msg := model.GetStatusMessage()
+	if msg == "" {
+		t.Error("GetStatusMessage should return a message for items without logs")
+	}
+
+	// Expand stage and move to task with log
+	model.ToggleExpand()
+	model.MoveDown()
+	if model.SelectedItem().Record.LogID == 0 {
+		t.Error("Second item (task) should have a log")
+	}
+
+	// Status message should be empty or indicate logs are available
+	msg = model.GetStatusMessage()
+	if strings.Contains(msg, "no log") {
+		t.Error("GetStatusMessage should not say 'no log' for items with logs")
+	}
+}
+
+func TestDetailModel_CanViewLogs(t *testing.T) {
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build Stage", Order: 1},
+			{ID: "task-1", ParentID: "stage-1", Type: "Task", Name: "npm install", Order: 1, LogID: 5},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModel(nil, run)
+	model.SetTimeline(timeline)
+
+	// Stage should not be viewable
+	if model.CanViewLogs() {
+		t.Error("CanViewLogs() should return false for stage without logs")
+	}
+
+	// Expand stage and move to task with log
+	model.ToggleExpand()
+	model.MoveDown()
+	if !model.CanViewLogs() {
+		t.Error("CanViewLogs() should return true for task with logs")
+	}
+}
+
+func TestDetailModel_GetContextItems(t *testing.T) {
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModel(nil, run)
+
+	items := model.GetContextItems()
+
+	// Should have keybinding items
+	if len(items) == 0 {
+		t.Error("GetContextItems() should return items")
+	}
+
+	// Should include navigation keys
+	found := false
+	for _, item := range items {
+		if strings.Contains(item.Key, "↑↓") || strings.Contains(item.Description, "navigate") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("GetContextItems() should include navigation keybinding")
+	}
+}
+
+func TestDetailModel_GetScrollPercent(t *testing.T) {
+	records := make([]provider.TimelineRecord, 50)
+	for i := 0; i < 50; i++ {
+		records[i] = provider.TimelineRecord{
+			ID:       fmt.Sprintf("task-%d", i),
+			ParentID: "",
+			Type:     "Task",
+			Name:     fmt.Sprintf("Task %d", i),
+			Order:    i,
+		}
+	}
+
+	timeline := &provider.Timeline{Identity: provider.Identity{ID: "test", Scope: "proj"}, Records: records}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModel(nil, run)
+	model.SetSize(80, 20)
+	model.SetTimeline(timeline)
+
+	// Initially should be at top (0%)
+	percent := model.GetScrollPercent()
+	if percent != 0 {
+		t.Errorf("GetScrollPercent() at top = %f, want 0", percent)
+	}
+
+	// After scrolling down, percent should increase
+	for i := 0; i < 30; i++ {
+		model.MoveDown()
+	}
+	newPercent := model.GetScrollPercent()
+	if newPercent <= percent {
+		t.Errorf("GetScrollPercent() should increase after scrolling down, was %f now %f", percent, newPercent)
+	}
+
+	// At selection 30 out of 49 (0-indexed), percent should be ~61%
+	expectedPercent := float64(30) / float64(49) * 100
+	if newPercent < expectedPercent-1 || newPercent > expectedPercent+1 {
+		t.Errorf("GetScrollPercent() at index 30/49 = %f, want ~%f", newPercent, expectedPercent)
+	}
+
+	// Move to the end - should be 100%
+	for i := 0; i < 20; i++ {
+		model.MoveDown()
+	}
+	endPercent := model.GetScrollPercent()
+	if endPercent != 100 {
+		t.Errorf("GetScrollPercent() at end = %f, want 100", endPercent)
+	}
+}
+
+func TestTimelineNode_HasChildren(t *testing.T) {
+	node := &TimelineNode{
+		Record:   provider.TimelineRecord{ID: "stage-1", Type: "Stage", Name: "Build"},
+		Children: []*TimelineNode{},
+	}
+
+	if node.HasChildren() {
+		t.Error("Node with empty children slice should not have children")
+	}
+
+	node.Children = []*TimelineNode{
+		{Record: provider.TimelineRecord{ID: "job-1", Type: "Job", Name: "Build Job"}},
+	}
+
+	if !node.HasChildren() {
+		t.Error("Node with children should have children")
+	}
+}
+
+func TestDetailModel_NodesStartCollapsed(t *testing.T) {
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "job-1", ParentID: "stage-1", Type: "Job", Name: "Build Job", Order: 1},
+			{ID: "task-1", ParentID: "job-1", Type: "Task", Name: "npm install", Order: 1},
+			{ID: "stage-2", ParentID: "", Type: "Stage", Name: "Test", Order: 2},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModel(nil, run)
+	model.SetTimeline(timeline)
+
+	// Stages should start collapsed — flatItems should only contain the 2 stages
+	if len(model.flatItems) != 2 {
+		t.Errorf("Expected 2 flat items (collapsed stages), got %d", len(model.flatItems))
+	}
+
+	if model.flatItems[0].Record.Name != "Build" {
+		t.Errorf("First flat item = %q, want Build", model.flatItems[0].Record.Name)
+	}
+	if model.flatItems[1].Record.Name != "Test" {
+		t.Errorf("Second flat item = %q, want Test", model.flatItems[1].Record.Name)
+	}
+}
+
+func TestDetailModel_ToggleExpand(t *testing.T) {
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "job-1", ParentID: "stage-1", Type: "Job", Name: "Build Job", Order: 1},
+			{ID: "task-1", ParentID: "job-1", Type: "Task", Name: "npm install", Order: 1},
+			{ID: "task-2", ParentID: "job-1", Type: "Task", Name: "npm build", Order: 2},
+			{ID: "stage-2", ParentID: "", Type: "Stage", Name: "Test", Order: 2},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModel(nil, run)
+	model.SetTimeline(timeline)
+
+	// Initially collapsed: only 2 stages visible
+	if len(model.flatItems) != 2 {
+		t.Fatalf("Expected 2 flat items initially, got %d", len(model.flatItems))
+	}
+
+	// Toggle expand on stage-1 (selected by default)
+	model.ToggleExpand()
+
+	// After expanding stage-1: stage-1, job-1, stage-2 (job is collapsed so tasks hidden)
+	if len(model.flatItems) != 3 {
+		t.Fatalf("Expected 3 flat items after expanding stage, got %d", len(model.flatItems))
+	}
+
+	expectedOrder := []string{"Build", "Build Job", "Test"}
+	for i, name := range expectedOrder {
+		if model.flatItems[i].Record.Name != name {
+			t.Errorf("flatItems[%d] = %q, want %q", i, model.flatItems[i].Record.Name, name)
+		}
+	}
+
+	// Move to job-1 and expand it
+	model.MoveDown()
+	model.ToggleExpand()
+
+	// After expanding job-1: stage-1, job-1, task-1, task-2, stage-2
+	if len(model.flatItems) != 5 {
+		t.Fatalf("Expected 5 flat items after expanding job, got %d", len(model.flatItems))
+	}
+
+	expectedOrder = []string{"Build", "Build Job", "npm install", "npm build", "Test"}
+	for i, name := range expectedOrder {
+		if model.flatItems[i].Record.Name != name {
+			t.Errorf("flatItems[%d] = %q, want %q", i, model.flatItems[i].Record.Name, name)
+		}
+	}
+
+	// Collapse stage-1 again (move back to it)
+	model.selectedIndex = 0
+	model.ToggleExpand()
+
+	// After collapsing stage-1: stage-1, stage-2
+	if len(model.flatItems) != 2 {
+		t.Fatalf("Expected 2 flat items after collapsing stage, got %d", len(model.flatItems))
+	}
+}
+
+func TestDetailModel_ToggleExpandPreservesSelection(t *testing.T) {
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "job-1", ParentID: "stage-1", Type: "Job", Name: "Build Job", Order: 1},
+			{ID: "stage-2", ParentID: "", Type: "Stage", Name: "Test", Order: 2},
+			{ID: "job-2", ParentID: "stage-2", Type: "Job", Name: "Test Job", Order: 1},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModel(nil, run)
+	model.SetTimeline(timeline)
+
+	// Select stage-2 (index 1)
+	model.MoveDown()
+
+	// Expand stage-2
+	model.ToggleExpand()
+
+	// Selection should stay on stage-2 (still index 1)
+	selected := model.SelectedItem()
+	if selected == nil || selected.Record.Name != "Test" {
+		name := ""
+		if selected != nil {
+			name = selected.Record.Name
+		}
+		t.Errorf("After expanding, selected should be Test, got %q", name)
+	}
+}
+
+func TestDetailModel_ToggleDoesNothingOnLeafNode(t *testing.T) {
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "task-1", ParentID: "stage-1", Type: "Task", Name: "npm install", Order: 1},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModel(nil, run)
+	model.SetTimeline(timeline)
+
+	// Expand stage to see the task
+	model.ToggleExpand()
+
+	// Move to the task (leaf node)
+	model.MoveDown()
+
+	prevLen := len(model.flatItems)
+	model.ToggleExpand()
+
+	// Nothing should change
+	if len(model.flatItems) != prevLen {
+		t.Errorf("ToggleExpand on leaf node should not change flatItems count, was %d now %d", prevLen, len(model.flatItems))
+	}
+}
+
+func TestDetailModel_RenderShowsExpandIndicator(t *testing.T) {
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", State: "completed", Result: "succeeded", Order: 1},
+			{ID: "job-1", ParentID: "stage-1", Type: "Job", Name: "Build Job", State: "completed", Result: "succeeded", Order: 1},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModelWithStyles(nil, run, styles.DefaultStyles())
+	model.SetTimeline(timeline)
+
+	// Collapsed stage should show ▶
+	rendered := model.renderRecord(model.flatItems[0], false)
+	if !strings.Contains(rendered, "▶") {
+		t.Errorf("Collapsed node should show ▶, got %q", rendered)
+	}
+
+	// Expand and check for ▼
+	model.ToggleExpand()
+	rendered = model.renderRecord(model.flatItems[0], false)
+	if !strings.Contains(rendered, "▼") {
+		t.Errorf("Expanded node should show ▼, got %q", rendered)
+	}
+}
+
+func TestDetailModel_CollapseAdjustsSelectionIfBeyondBounds(t *testing.T) {
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "job-1", ParentID: "stage-1", Type: "Job", Name: "Build Job", Order: 1},
+			{ID: "task-1", ParentID: "job-1", Type: "Task", Name: "npm install", Order: 1},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModel(nil, run)
+	model.SetTimeline(timeline)
+
+	// Expand everything
+	model.ToggleExpand() // expand stage
+	model.MoveDown()
+	model.ToggleExpand() // expand job
+
+	// Now at index 1, move to task at index 2
+	model.MoveDown()
+	if model.SelectedIndex() != 2 {
+		t.Fatalf("Expected selected index 2, got %d", model.SelectedIndex())
+	}
+
+	// Now collapse stage-1 from index 0
+	model.selectedIndex = 0
+	model.ToggleExpand()
+
+	// After collapse, only 1 item (stage-1). Selection should clamp.
+	if model.selectedIndex >= len(model.flatItems) {
+		t.Errorf("Selection %d should be within bounds (len=%d)", model.selectedIndex, len(model.flatItems))
+	}
+}
+
+func TestFlattenTreeRespectsExpanded(t *testing.T) {
+	// Build a tree manually with Expanded flags
+	tree := []*TimelineNode{
+		{
+			Record:   provider.TimelineRecord{ID: "s1", Type: "Stage", Name: "Build"},
+			Expanded: true,
+			Children: []*TimelineNode{
+				{
+					Record:   provider.TimelineRecord{ID: "j1", Type: "Job", Name: "Build Job"},
+					Expanded: false,
+					Children: []*TimelineNode{
+						{Record: provider.TimelineRecord{ID: "t1", Type: "Task", Name: "npm install"}},
+					},
+				},
+			},
+		},
+		{
+			Record:   provider.TimelineRecord{ID: "s2", Type: "Stage", Name: "Test"},
+			Expanded: false,
+			Children: []*TimelineNode{
+				{Record: provider.TimelineRecord{ID: "j2", Type: "Job", Name: "Test Job"}},
+			},
+		},
+	}
+
+	flat := flattenTree(tree)
+
+	// s1 expanded → shows s1, j1. j1 collapsed → hides t1. s2 collapsed → hides j2.
+	expectedNames := []string{"Build", "Build Job", "Test"}
+	if len(flat) != len(expectedNames) {
+		t.Fatalf("Expected %d flat items, got %d", len(expectedNames), len(flat))
+	}
+
+	for i, name := range expectedNames {
+		if flat[i].Record.Name != name {
+			t.Errorf("flat[%d] = %q, want %q", i, flat[i].Record.Name, name)
+		}
+	}
+}
+
+func TestDisplayFiltersPhaseAndCheckpoint(t *testing.T) {
+	// Azure DevOps timelines include Phase and Checkpoint intermediary records.
+	// These should be hidden in the UI but their children shown as if direct.
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "checkpoint-1", ParentID: "stage-1", Type: "Checkpoint", Name: "Checkpoint", Order: 1},
+			{ID: "phase-1", ParentID: "stage-1", Type: "Phase", Name: "Phase 1", Order: 2},
+			{ID: "job-1", ParentID: "phase-1", Type: "Job", Name: "Build Job", Order: 1, LogID: 5},
+			{ID: "task-1", ParentID: "job-1", Type: "Task", Name: "npm install", Order: 1},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModel(nil, run)
+	model.SetTimeline(timeline)
+
+	// Collapsed: only stage visible (Phase and Checkpoint hidden)
+	if len(model.flatItems) != 1 {
+		t.Fatalf("Expected 1 flat item (collapsed), got %d", len(model.flatItems))
+	}
+	if model.flatItems[0].Record.Name != "Build" {
+		t.Errorf("First item = %q, want Build", model.flatItems[0].Record.Name)
+	}
+
+	// Stage should report having children (Jobs visible through Phase)
+	if !model.flatItems[0].HasChildren() {
+		t.Error("Stage with Phase→Job children should report HasChildren=true")
+	}
+
+	// Expand stage: should show Job (Phase/Checkpoint filtered out)
+	model.ToggleExpand()
+	if len(model.flatItems) != 2 {
+		t.Fatalf("Expected 2 flat items after expand, got %d", len(model.flatItems))
+	}
+	if model.flatItems[1].Record.Name != "Build Job" {
+		t.Errorf("Second item = %q, want Build Job", model.flatItems[1].Record.Name)
+	}
+
+	// Expand job: should show Task
+	model.MoveDown()
+	model.ToggleExpand()
+	if len(model.flatItems) != 3 {
+		t.Fatalf("Expected 3 flat items, got %d", len(model.flatItems))
+	}
+	if model.flatItems[2].Record.Name != "npm install" {
+		t.Errorf("Third item = %q, want npm install", model.flatItems[2].Record.Name)
+	}
+}
+
+func TestDisplayJobWithLogNoTasksIsLeaf(t *testing.T) {
+	// When a Job (under a Phase) has a log but no tasks, it should be a leaf node
+	// (no ▶ icon, Enter opens log)
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "phase-1", ParentID: "stage-1", Type: "Phase", Name: "Phase 1", Order: 1},
+			{ID: "job-1", ParentID: "phase-1", Type: "Job", Name: "Build Job", Order: 1, LogID: 5},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModel(nil, run)
+	model.SetTimeline(timeline)
+
+	// Collapsed: only stage visible
+	if len(model.flatItems) != 1 {
+		t.Fatalf("Expected 1 flat item (collapsed), got %d", len(model.flatItems))
+	}
+
+	// Expand stage
+	model.ToggleExpand()
+
+	// Should show stage + job (Phase filtered from display)
+	if len(model.flatItems) != 2 {
+		t.Fatalf("Expected 2 flat items after expand, got %d", len(model.flatItems))
+	}
+
+	// Job should report no visible children (it's a leaf with a log)
+	job := model.flatItems[1]
+	if job.HasChildren() {
+		t.Error("Job with no tasks should not have visible children")
+	}
+	if job.Record.LogID == 0 {
+		t.Error("Job should have a log")
+	}
+}
+
+func TestDisplayMultipleJobsUnderPhase(t *testing.T) {
+	// All jobs under a stage (through Phases) should be hidden when collapsed
+	// and shown when expanded — no job should leak out as a root
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Deploy", Order: 1},
+			{ID: "checkpoint-1", ParentID: "stage-1", Type: "Checkpoint", Name: "Approval", Order: 1},
+			{ID: "phase-1", ParentID: "stage-1", Type: "Phase", Name: "Phase 1", Order: 2},
+			{ID: "job-1", ParentID: "phase-1", Type: "Job", Name: "Job A", Order: 1},
+			{ID: "phase-2", ParentID: "stage-1", Type: "Phase", Name: "Phase 2", Order: 3},
+			{ID: "job-2", ParentID: "phase-2", Type: "Job", Name: "Job B", Order: 1},
+			{ID: "phase-3", ParentID: "stage-1", Type: "Phase", Name: "Phase 3", Order: 4},
+			{ID: "job-3", ParentID: "phase-3", Type: "Job", Name: "Job C", Order: 1},
+			{ID: "phase-4", ParentID: "stage-1", Type: "Phase", Name: "Phase 4", Order: 5},
+			{ID: "job-4", ParentID: "phase-4", Type: "Job", Name: "Job D", Order: 1, LogID: 10},
+			{ID: "task-1", ParentID: "job-4", Type: "Task", Name: "Deploy task", Order: 1},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "20240206.1"}
+	model := NewDetailModel(nil, run)
+	model.SetTimeline(timeline)
+
+	// Collapsed: only the stage should be visible — ALL jobs hidden
+	if len(model.flatItems) != 1 {
+		t.Fatalf("Expected 1 flat item (collapsed stage), got %d", len(model.flatItems))
+	}
+	if model.flatItems[0].Record.Name != "Deploy" {
+		t.Errorf("First item = %q, want Deploy", model.flatItems[0].Record.Name)
+	}
+
+	// Expand stage: should show all 4 jobs
+	model.ToggleExpand()
+	if len(model.flatItems) != 5 {
+		t.Fatalf("Expected 5 flat items (stage + 4 jobs), got %d", len(model.flatItems))
+	}
+
+	expectedNames := []string{"Deploy", "Job A", "Job B", "Job C", "Job D"}
+	for i, name := range expectedNames {
+		if model.flatItems[i].Record.Name != name {
+			t.Errorf("flatItems[%d] = %q, want %q", i, model.flatItems[i].Record.Name, name)
+		}
+	}
+}
+
+// --- Search/Filter Tests ---
+
+func TestDetailModel_SearchFiltersItems(t *testing.T) {
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "stage-2", ParentID: "", Type: "Stage", Name: "Deploy", Order: 2},
+			{ID: "stage-3", ParentID: "", Type: "Stage", Name: "Test Build", Order: 3},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "1"}
+	model := NewDetailModel(nil, run)
+	model.SetSize(80, 30)
+	model.SetTimeline(timeline)
+
+	if len(model.flatItems) != 3 {
+		t.Fatalf("Expected 3 flat items initially, got %d", len(model.flatItems))
+	}
+
+	// Enter search mode
+	model.EnterSearch()
+	if !model.IsSearching() {
+		t.Fatal("Expected to be in search mode")
+	}
+
+	// Apply filter for "build"
+	model.SetSearchQuery("build")
+
+	// Should match "Build" and "Test Build"
+	if len(model.flatItems) != 2 {
+		t.Errorf("Expected 2 filtered items, got %d", len(model.flatItems))
+	}
+}
+
+func TestDetailModel_SlashSearchAndRepeatedJKNavigation(t *testing.T) {
+	model := NewDetailModel(nil, provider.PipelineRun{})
+	model.SetSize(80, 24)
+	model.SetTimeline(&provider.Timeline{Records: []provider.TimelineRecord{
+		{ID: "task-1", Type: "Task", Name: "Build app", Order: 1},
+		{ID: "task-2", Type: "Task", Name: "Run tests", Order: 2},
+		{ID: "task-3", Type: "Task", Name: "Package app", Order: 3},
+	}})
+
+	model, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	if !model.IsSearching() || cmd == nil {
+		t.Fatal("pressing / should enter timeline search and focus the search input")
+	}
+	model.SetSearchQuery("app")
+	if len(model.flatItems) != 2 {
+		t.Fatalf("search matches = %d, want 2", len(model.flatItems))
+	}
+
+	for range 2 {
+		model, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	}
+	if got := model.SelectedIndex(); got != 1 {
+		t.Fatalf("two repeated j events selected index %d, want 1 (clamped to last match)", got)
+	}
+	model, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	if got := model.SelectedIndex(); got != 0 {
+		t.Fatalf("k event selected index %d, want 0", got)
+	}
+}
+
+func TestDetailModel_SearchExitRestoresItems(t *testing.T) {
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "stage-2", ParentID: "", Type: "Stage", Name: "Deploy", Order: 2},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "1"}
+	model := NewDetailModel(nil, run)
+	model.SetSize(80, 30)
+	model.SetTimeline(timeline)
+
+	// Enter search, filter, then exit
+	model.EnterSearch()
+	model.SetSearchQuery("build")
+	if len(model.flatItems) != 1 {
+		t.Fatalf("Expected 1 filtered item, got %d", len(model.flatItems))
+	}
+
+	model.ExitSearch()
+	if model.IsSearching() {
+		t.Error("Should not be searching after ExitSearch")
+	}
+
+	// All items should be restored
+	if len(model.flatItems) != 2 {
+		t.Errorf("Expected 2 items after exiting search, got %d", len(model.flatItems))
+	}
+}
+
+func TestDetailModel_SearchIsCaseInsensitive(t *testing.T) {
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "stage-2", ParentID: "", Type: "Stage", Name: "DEPLOY", Order: 2},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "1"}
+	model := NewDetailModel(nil, run)
+	model.SetSize(80, 30)
+	model.SetTimeline(timeline)
+
+	model.EnterSearch()
+	model.SetSearchQuery("deploy")
+
+	if len(model.flatItems) != 1 {
+		t.Errorf("Expected 1 match (case-insensitive), got %d", len(model.flatItems))
+	}
+	if model.flatItems[0].Record.Name != "DEPLOY" {
+		t.Errorf("Expected 'DEPLOY', got %q", model.flatItems[0].Record.Name)
+	}
+}
+
+func TestDetailModel_SearchFindsCollapsedChildren(t *testing.T) {
+	// Bug: search should find items inside collapsed nodes, not just visible ones
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "phase-1", ParentID: "stage-1", Type: "Phase", Name: "Phase", Order: 1},
+			{ID: "job-1", ParentID: "phase-1", Type: "Job", Name: "Build Job", Order: 1},
+			{ID: "task-1", ParentID: "job-1", Type: "Task", Name: "npm install", Order: 1},
+			{ID: "task-2", ParentID: "job-1", Type: "Task", Name: "npm test", Order: 2},
+			{ID: "stage-2", ParentID: "", Type: "Stage", Name: "Deploy", Order: 2},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "1"}
+	model := NewDetailModel(nil, run)
+	model.SetSize(80, 30)
+	model.SetTimeline(timeline)
+
+	// Initially only stages are visible (collapsed)
+	if len(model.flatItems) != 2 {
+		t.Fatalf("Expected 2 flat items initially (stages collapsed), got %d", len(model.flatItems))
+	}
+
+	// Enter search and search for a nested task name
+	model.EnterSearch()
+	model.SetSearchQuery("npm install")
+
+	// Should find "npm install" even though it's inside a collapsed stage
+	if len(model.flatItems) != 1 {
+		t.Errorf("Expected 1 match for collapsed child search, got %d", len(model.flatItems))
+	}
+	if len(model.flatItems) > 0 && model.flatItems[0].Record.Name != "npm install" {
+		t.Errorf("Expected match to be 'npm install', got %q", model.flatItems[0].Record.Name)
+	}
+}
+
+func TestDetailModel_SearchEnterToggleExpandDuringSearch(t *testing.T) {
+	// Bug: pressing enter during search should still toggle expand/collapse
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "phase-1", ParentID: "stage-1", Type: "Phase", Name: "Phase", Order: 1},
+			{ID: "job-1", ParentID: "phase-1", Type: "Job", Name: "Build Job", Order: 1},
+			{ID: "stage-2", ParentID: "", Type: "Stage", Name: "Deploy", Order: 2},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "1"}
+	model := NewDetailModel(nil, run)
+	model.SetSize(80, 30)
+	model.SetTimeline(timeline)
+
+	// Enter search, search for "Build" which should match the stage
+	model.EnterSearch()
+	model.SetSearchQuery("build")
+
+	// Should find "Build" stage and "Build Job"
+	foundStage := false
+	for _, item := range model.flatItems {
+		if item.Record.Name == "Build" && item.Record.Type == "Stage" {
+			foundStage = true
+		}
+	}
+	if !foundStage {
+		t.Fatal("Expected to find 'Build' stage in search results")
+	}
+
+	// Select the Build stage and toggle expand via the model method
+	model.selectedIndex = 0
+	if model.flatItems[0].Record.Name != "Build" {
+		t.Fatalf("Expected first item to be 'Build', got %q", model.flatItems[0].Record.Name)
+	}
+
+	// ToggleExpand should work during search
+	model.ToggleExpand()
+
+	// After expanding, we should see children
+	if !model.flatItems[0].Expanded {
+		t.Error("Expected 'Build' stage to be expanded after ToggleExpand")
+	}
+}
+
+func TestDetailModel_SearchExitRestoresAllTreeItems(t *testing.T) {
+	// After searching (which searches all tree nodes), exiting search should
+	// restore the flat items from the tree (respecting expand/collapse state)
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+			{ID: "phase-1", ParentID: "stage-1", Type: "Phase", Name: "Phase", Order: 1},
+			{ID: "job-1", ParentID: "phase-1", Type: "Job", Name: "Build Job", Order: 1},
+			{ID: "stage-2", ParentID: "", Type: "Stage", Name: "Deploy", Order: 2},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "1"}
+	model := NewDetailModel(nil, run)
+	model.SetSize(80, 30)
+	model.SetTimeline(timeline)
+
+	// Start with 2 items (stages collapsed)
+	if len(model.flatItems) != 2 {
+		t.Fatalf("Expected 2 flat items initially, got %d", len(model.flatItems))
+	}
+
+	// Search and exit
+	model.EnterSearch()
+	model.SetSearchQuery("job")
+	model.ExitSearch()
+
+	// Should restore to 2 items (tree-based flat, not the "all nodes" list)
+	if len(model.flatItems) != 2 {
+		t.Errorf("Expected 2 items after exiting search (stages collapsed), got %d", len(model.flatItems))
+	}
+}
+
+// --- Key handling via Update() ---
+
+func TestDetailModel_RefreshKey_SetsLoadingAndReturnsCmd(t *testing.T) {
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "1", DefinitionName: "Build"}
+	model := NewDetailModel(nil, run)
+	model.SetSize(80, 30)
+	model.SetTimeline(timeline)
+
+	if model.loading {
+		t.Fatal("Model should not be loading before refresh")
+	}
+
+	// Press 'r' to refresh
+	model, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+
+	if !model.loading {
+		t.Error("After 'r', model should be in loading state")
+	}
+	if cmd == nil {
+		t.Error("After 'r', expected a command to fetch timeline")
+	}
+}
+
+func TestDetailModel_RefreshKey_IgnoredDuringSearch(t *testing.T) {
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "1", DefinitionName: "Build"}
+	model := NewDetailModel(nil, run)
+	model.SetSize(80, 30)
+	model.SetTimeline(timeline)
+
+	// Enter search mode first
+	model.EnterSearch()
+
+	// Press 'r' during search — should be treated as search input, not refresh
+	model, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+
+	if model.loading {
+		t.Error("'r' during search should not trigger refresh")
+	}
+	// The 'r' should have been typed into the search input
+	if model.searchInput.Value() != "r" {
+		t.Errorf("Expected search input to contain 'r', got %q", model.searchInput.Value())
+	}
+}
+
+func TestDetailModel_SearchKey_EntersSearchMode(t *testing.T) {
+	timeline := &provider.Timeline{
+		Identity: provider.Identity{ID: "test", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "stage-1", ParentID: "", Type: "Stage", Name: "Build", Order: 1},
+		},
+	}
+
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "1", DefinitionName: "Build"}
+	model := NewDetailModel(nil, run)
+	model.SetSize(80, 30)
+	model.SetTimeline(timeline)
+
+	if model.IsSearching() {
+		t.Fatal("Model should not be searching initially")
+	}
+
+	// Press 'f' to enter search
+	model, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("f")})
+
+	if !model.IsSearching() {
+		t.Error("After 'f', model should be in search mode")
+	}
+	if cmd == nil {
+		t.Error("After 'f', expected a command to focus the search input")
+	}
+}
+
+func TestDetailModel_SearchKey_IgnoredWhenEmpty(t *testing.T) {
+	// 'f' should not enter search if there are no items
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "123", Scope: "proj"}, BuildNumber: "1", DefinitionName: "Build"}
+	model := NewDetailModel(nil, run)
+	model.SetSize(80, 30)
+	// No timeline set — flatItems is empty
+
+	model, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("f")})
+
+	if model.IsSearching() {
+		t.Error("'f' should not enter search when there are no items")
+	}
+}
+
+// pipelineURLStub is a minimal provider.Provider whose PipelineURL returns a
+// fixed string, used to exercise the open-in-browser client fallback.
+type pipelineURLStub struct {
+	provider.Provider
+	url string
+}
+
+func (s pipelineURLStub) PipelineURL(scope string, id int) string { return s.url }
+
+func TestDetailModel_GetContextItemsIncludesOpenInBrowser(t *testing.T) {
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "1", Scope: "proj"}}
+	m := NewDetailModel(nil, run)
+
+	found := false
+	for _, item := range m.GetContextItems() {
+		if item.Key == "o" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Expected context items to include 'o' keybinding for open in browser")
+	}
+}
+
+func TestDetailModel_GetContextItemsIncludesRunParametersForAzure(t *testing.T) {
+	m := NewDetailModel(nil, provider.PipelineRun{
+		Identity: provider.Identity{Kind: provider.KindAzure, ID: "45", Scope: "project"},
+	})
+	for _, item := range m.GetContextItems() {
+		if item.Key == "zP" {
+			return
+		}
+	}
+	t.Fatal("expected Azure pipeline detail context to include zP")
+}
+
+type pipelineApprovalStub struct {
+	provider.Provider
+	approvals     []provider.PipelineApproval
+	scope         string
+	approvedID    string
+	approvalError error
+}
+
+func (*pipelineApprovalStub) HasPipelineApprovals() bool { return true }
+
+func (s *pipelineApprovalStub) ListPendingPipelineApprovals(scope string) ([]provider.PipelineApproval, error) {
+	s.scope = scope
+	return s.approvals, nil
+}
+
+func (s *pipelineApprovalStub) ApprovePipelineResourceApproval(scope, approvalID string) error {
+	s.scope = scope
+	s.approvedID = approvalID
+	return s.approvalError
+}
+
+func TestDetailModelApprovesPendingPipelineResourceApproval(t *testing.T) {
+	client := &pipelineApprovalStub{
+		approvals: []provider.PipelineApproval{{
+			ID: "approval-123", Status: "pending", Instructions: "Approve service connection Deploy",
+		}},
+	}
+	model := NewDetailModel(client, provider.PipelineRun{
+		Identity: provider.Identity{
+			Kind: provider.KindAzure, ID: "45", Scope: "project",
+		},
+		DefinitionID:   12,
+		DefinitionName: "Deploy",
+	})
+	model.SetSize(80, 24)
+
+	found := false
+	for _, item := range model.GetContextItems() {
+		if item.Key == "p" && item.Description == "pending resource approvals" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("Azure pipeline detail context does not show pending resource approvals")
+	}
+
+	model, cmd := model.Update(pipelineKey('p'))
+	if cmd == nil || model.approvals == nil {
+		t.Fatal("p should open pending approvals and start loading")
+	}
+	loaded := cmd()
+	model, _ = model.Update(loaded)
+	if client.scope != "project" || !strings.Contains(model.View(), "Approve service connection Deploy") {
+		t.Fatalf("approval view did not load project request instructions: %s", model.View())
+	}
+	if !(&detailAdapter{model: model}).ShouldHandleEscape() || !model.IsSearching() {
+		t.Fatal("approval view should capture input and handle Escape")
+	}
+
+	model, cmd = model.Update(pipelineKey('a'))
+	if cmd == nil {
+		t.Fatal("a should approve the selected resource request")
+	}
+	model, _ = model.Update(cmd())
+	if client.scope != "project" || client.approvedID != "approval-123" {
+		t.Fatalf("approval request routed to %q/%q, want project/approval-123", client.scope, client.approvedID)
+	}
+	if !strings.Contains(model.View(), "No pending resource approvals") {
+		t.Fatalf("approved request remains pending in the view: %s", model.View())
+	}
+}
+
+type pipelineRunParametersStub struct {
+	provider.Provider
+	parameters map[string]any
+	scope      string
+	pipelineID int
+	runID      int
+	err        error
+}
+
+func (s *pipelineRunParametersStub) GetPipelineRunParameters(scope string, pipelineID, runID int) (map[string]any, error) {
+	s.scope, s.pipelineID, s.runID = scope, pipelineID, runID
+	return s.parameters, s.err
+}
+
+func TestDetailModel_ZPShowsParametersForRecentRun(t *testing.T) {
+	client := &pipelineRunParametersStub{parameters: map[string]any{
+		"environment": "production",
+		"replicas":    float64(3),
+	}}
+	run := provider.PipelineRun{
+		Identity:       provider.Identity{Kind: provider.KindAzure, ID: "45", Scope: "project"},
+		DefinitionID:   12,
+		DefinitionName: "Deploy",
+		BuildNumber:    "2026.10.19.1",
+	}
+	model := NewDetailModel(client, run)
+	model.SetSize(80, 24)
+
+	model, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	model, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+	if cmd == nil || !model.showRunParams {
+		t.Fatal("zP should open the runtime parameter view and start loading")
+	}
+	if !(&detailAdapter{model: model}).ShouldHandleEscape() {
+		t.Fatal("detail adapter should handle Esc while the parameter view is open")
+	}
+
+	msg := cmd()
+	loaded, ok := msg.(runParametersLoadedMsg)
+	if !ok {
+		t.Fatalf("parameter command returned %T, want runParametersLoadedMsg", msg)
+	}
+	model, _ = model.Update(loaded)
+	if client.scope != "project" || client.pipelineID != 12 || client.runID != 45 {
+		t.Fatalf("parameter lookup = %q/%d/%d, want project/12/45", client.scope, client.pipelineID, client.runID)
+	}
+	view := model.View()
+	if !strings.Contains(view, "environment: production") || !strings.Contains(view, "replicas: 3") {
+		t.Fatalf("runtime parameter view missing captured values:\n%s", view)
+	}
+
+	model, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if model.showRunParams {
+		t.Error("Esc should return from runtime parameters to the timeline")
+	}
+	if (&detailAdapter{model: model}).ShouldHandleEscape() {
+		t.Error("detail adapter should stop intercepting Esc after returning to the timeline")
+	}
+}
+
+func TestDetailModel_OKeyOpensBrowserUsingWebURL(t *testing.T) {
+	origOpen := openURL
+	defer func() { openURL = origOpen }()
+
+	var openedURL string
+	openURL = func(url string) error {
+		openedURL = url
+		return nil
+	}
+
+	run := provider.PipelineRun{
+		Identity: provider.Identity{Kind: provider.KindGitHub, Scope: "owner/repo", ID: "99"},
+		WebURL:   "https://github.com/owner/repo/actions/runs/99",
+	}
+	m := NewDetailModel(nil, run)
+	m.SetSize(80, 30)
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	if cmd == nil {
+		t.Fatal("Expected command after pressing 'o'")
+	}
+
+	msg := cmd()
+	if _, ok := msg.(openURLResultMsg); !ok {
+		t.Fatalf("Expected openURLResultMsg, got %T", msg)
+	}
+
+	want := "https://github.com/owner/repo/actions/runs/99"
+	if openedURL != want {
+		t.Errorf("openURL called with %q, want %q", openedURL, want)
+	}
+}
+
+func TestDetailModel_OKeyFallsBackToPipelineURL(t *testing.T) {
+	origOpen := openURL
+	defer func() { openURL = origOpen }()
+
+	var openedURL string
+	openURL = func(url string) error {
+		openedURL = url
+		return nil
+	}
+
+	// No WebURL on the run, so the view must fall back to the provider builder.
+	want := "https://dev.azure.com/myorg/myproject/_build/results?buildId=7"
+	run := provider.PipelineRun{Identity: provider.Identity{Scope: "myproject", ID: "7"}}
+	m := NewDetailModel(pipelineURLStub{url: want}, run)
+	m.SetSize(80, 30)
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	if cmd == nil {
+		t.Fatal("Expected command after pressing 'o'")
+	}
+	if _, ok := cmd().(openURLResultMsg); !ok {
+		t.Fatal("Expected openURLResultMsg")
+	}
+	if openedURL != want {
+		t.Errorf("openURL called with %q, want %q", openedURL, want)
+	}
+}
+
+func TestDetailModel_OKeyNoURLSetsStatusMessage(t *testing.T) {
+	origOpen := openURL
+	defer func() { openURL = origOpen }()
+	openURL = func(string) error {
+		t.Fatal("openURL must not be called when no URL can be built")
+		return nil
+	}
+
+	// Empty WebURL and nil client → no URL can be produced.
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "1", Scope: "proj"}}
+	m := NewDetailModel(nil, run)
+	m.SetSize(80, 30)
+
+	m, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	if cmd != nil {
+		t.Error("Expected no command when URL cannot be built")
+	}
+	if m.GetStatusMessage() == "" {
+		t.Error("Expected status message when URL cannot be built")
+	}
+}
+
+func TestDetailModel_OpenURLResultSuccessSetsStatusMessage(t *testing.T) {
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "1", Scope: "proj"}}
+	m := NewDetailModel(nil, run)
+	m.SetSize(80, 30)
+
+	m, _ = m.Update(openURLResultMsg{err: nil})
+
+	if m.GetStatusMessage() == "" {
+		t.Error("Expected a success status message after opening in browser")
+	}
+}
+
+func TestDetailModel_OpenURLResultErrorSetsStatusMessage(t *testing.T) {
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "1", Scope: "proj"}}
+	m := NewDetailModel(nil, run)
+	m.SetSize(80, 30)
+
+	m, _ = m.Update(openURLResultMsg{err: fmt.Errorf("no browser")})
+
+	got := strings.ToLower(m.GetStatusMessage())
+	if !strings.Contains(got, "fail") && !strings.Contains(got, "error") {
+		t.Errorf("Expected error status message, got %q", m.GetStatusMessage())
+	}
+}
+
+func TestDetailModel_NavigationClearsBrowserStatus(t *testing.T) {
+	run := provider.PipelineRun{Identity: provider.Identity{ID: "1", Scope: "proj"}}
+	m := NewDetailModel(nil, run)
+	m.SetSize(80, 30)
+
+	// Two navigable records so MoveDown actually moves.
+	m.SetTimeline(&provider.Timeline{
+		Identity: provider.Identity{ID: "t", Scope: "proj"},
+		Records: []provider.TimelineRecord{
+			{ID: "a", Type: "Task", Name: "A", Order: 0},
+			{ID: "b", Type: "Task", Name: "B", Order: 1},
+		},
+	})
+
+	m, _ = m.Update(openURLResultMsg{err: nil})
+	if m.GetStatusMessage() != "Opened in browser" {
+		t.Fatalf("expected browser status, got %q", m.GetStatusMessage())
+	}
+
+	m.MoveDown()
+	if m.GetStatusMessage() == "Opened in browser" {
+		t.Error("Expected navigation to clear the transient browser status message")
+	}
+}
+
+// Helper functions
+
+func timePtr(t time.Time) *time.Time {
+	return &t
+}

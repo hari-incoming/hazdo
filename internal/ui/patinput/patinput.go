@@ -1,0 +1,158 @@
+package patinput
+
+import (
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+var (
+	titleStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("99"))
+
+	helpStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("99"))
+
+	errorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("196")).
+			Bold(true)
+)
+
+// PATSubmittedMsg is sent when a PAT has been successfully submitted
+type PATSubmittedMsg struct {
+	PAT string
+}
+
+// Model represents the PAT input view model
+type Model struct {
+	textInput textinput.Model
+	title     string
+	prompt    string
+	err       string
+	submitted bool
+}
+
+// NewModel creates a new PAT input model for first-time setup.
+func NewModel() Model {
+	return newModel(
+		"Azure DevOps PAT Setup",
+		"No PAT found in keyring. Please enter your Personal Access Token:",
+		"Enter your Azure DevOps Personal Access Token",
+	)
+}
+
+// NewModelForUpdate creates a new PAT input model for updating an existing PAT.
+func NewModelForUpdate() Model {
+	return newModel(
+		"Azure DevOps PAT Update",
+		"Enter your new Personal Access Token to replace the existing one:",
+		"Enter your Azure DevOps Personal Access Token",
+	)
+}
+
+// NewGitHubModel creates a new token input model for first-time GitHub setup.
+func NewGitHubModel() Model {
+	return newModel(
+		"GitHub Token Setup",
+		"No token found in keyring. Please enter your GitHub Personal Access Token:",
+		"Enter your GitHub token",
+	)
+}
+
+// NewGitHubModelForUpdate creates a new token input model for updating an existing GitHub token.
+func NewGitHubModelForUpdate() Model {
+	return newModel(
+		"GitHub Token Update",
+		"Enter your new GitHub Personal Access Token to replace the existing one:",
+		"Enter your GitHub token",
+	)
+}
+
+func newModel(title, prompt, placeholder string) Model {
+	ti := textinput.New()
+	ti.Placeholder = placeholder
+	ti.Focus()
+	ti.CharLimit = 500
+	ti.Width = 60
+	ti.EchoMode = textinput.EchoPassword
+	ti.EchoCharacter = '•'
+
+	return Model{
+		textInput: ti,
+		title:     title,
+		prompt:    prompt,
+		err:       "",
+		submitted: false,
+	}
+}
+
+// Init initializes the model
+func (m Model) Init() tea.Cmd {
+	return textinput.Blink
+}
+
+// Update handles messages and updates the model
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.Type {
+		case tea.KeyEnter:
+			// Validate PAT is not empty
+			pat := m.textInput.Value()
+			if pat == "" {
+				m.err = "PAT cannot be empty"
+				return m, nil
+			}
+
+			// Mark as submitted and return both the PAT and quit command
+			m.submitted = true
+			m.err = ""
+			return m, tea.Batch(
+				func() tea.Msg {
+					return PATSubmittedMsg{PAT: pat}
+				},
+				tea.Quit,
+			)
+
+		case tea.KeyEsc, tea.KeyCtrlC:
+			return m, tea.Quit
+		}
+	}
+
+	// Update text input
+	m.textInput, cmd = m.textInput.Update(msg)
+	return m, cmd
+}
+
+// View renders the PAT input view
+func (m Model) View() string {
+	var s string
+
+	s += titleStyle.Render(m.title) + "\n\n"
+	s += m.prompt + "\n\n"
+	s += m.textInput.View() + "\n\n"
+
+	if m.err != "" {
+		s += errorStyle.Render("Error: "+m.err) + "\n\n"
+	}
+
+	s += helpStyle.Render("Press Enter to submit • Esc to quit")
+
+	return s
+}
+
+// GetPAT returns the entered PAT value
+func (m Model) GetPAT() string {
+	return m.textInput.Value()
+}
+
+// PermissionInfoPlain returns the required PAT permissions as plain text (no ANSI styling).
+func PermissionInfoPlain() string {
+	return `Required PAT permissions:
+  Build        (Read & Execute) - list and queue pipelines, build logs
+  Code         (Read & Write) - pull requests, voting, comments
+  Work Items   (Read & Write) - queries, state changes`
+}

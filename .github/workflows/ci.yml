@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test installer detection
+        run: sh install_test.sh
+
+      - name: Run tests
+        id: test
+        run: |
+          set +e
+          go test -json -count=1 ./... > test-output.json 2>&1
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Show failing tests
+        if: always() && steps.test.outputs.exit_code != '0'
+        run: |
+          grep '^{' test-output.json > test-clean.json || true
+          FAILED_TESTS=$(jq -r 'select(.Action == "fail" and .Test != null) | "\(.Package)/\(.Test)"' test-clean.json)
+          if [ -z "$FAILED_TESTS" ]; then
+            echo "No individual test failures found (possible build error)"
+            cat test-output.json
+            exit 0
+          fi
+          for ft in $FAILED_TESTS; do
+            PKG="${ft%/*}"
+            TEST="${ft#*/}"
+            echo "=== FAIL: ${PKG} / ${TEST} ==="
+            jq -r --arg pkg "$PKG" --arg test "$TEST" \
+              'select(.Package == $pkg and .Test == $test and .Action == "output") | .Output' \
+              test-clean.json | tr -d '\n' | sed 's/$/\n/'
+            echo ""
+          done
+
+      - name: Generate test report
+        if: always() && steps.test.outcome != 'skipped'
+        run: |
+          # Filter to valid JSON lines only
+          grep '^{' test-output.json > test-clean.json || true
+
+          # Generate markdown report from JSON test output
+          jq -s '
+            [.[] | select(.Test != null and (.Action == "pass" or .Action == "fail" or .Action == "skip"))]
+            | group_by(.Package)
+            | map({
+                package: .[0].Package,
+                passed:  ([.[] | select(.Action == "pass")]  | length),
+                failed:  ([.[] | select(.Action == "fail")]  | length),
+                skipped: ([.[] | select(.Action == "skip")]  | length),
+                total:   length
+              })
+            | sort_by(.package)
+          ' test-clean.json > test-stats.json
+
+          PASSED=$(jq  '[.[].passed]  | add // 0' test-stats.json)
+          FAILED=$(jq  '[.[].failed]  | add // 0' test-stats.json)
+          SKIPPED=$(jq '[.[].skipped] | add // 0' test-stats.json)
+          TOTAL=$(jq   '[.[].total]   | add // 0' test-stats.json)
+
+          if [ "$FAILED" -gt 0 ]; then
+            ICON="❌"
+          else
+            ICON="✅"
+          fi
+
+          {
+            echo "<!-- ci-test-report -->"
+            echo "## ${ICON} Test Results"
+            echo ""
+            echo "| Package | Passed | Failed | Skipped | Total |"
+            echo "|---------|-------:|-------:|--------:|------:|"
+            jq -r '.[] | "| `\(.package)` | \(.passed) | \(.failed) | \(.skipped) | \(.total) |"' test-stats.json
+            echo "| **Total** | **${PASSED}** | **${FAILED}** | **${SKIPPED}** | **${TOTAL}** |"
+          } > test-report.md
+
+          cat test-report.md
+
+      - name: Fail if tests failed
+        if: always() && steps.test.outputs.exit_code != '0'
+        run: exit 1

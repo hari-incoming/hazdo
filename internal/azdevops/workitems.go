@@ -1,0 +1,509 @@
+package azdevops
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// WorkItemTypeState represents a state available for a work item type
+type WorkItemTypeState struct {
+	Name     string `json:"name"`
+	Color    string `json:"color"`
+	Category string `json:"category"`
+}
+
+// WorkItemTypeStatesResponse represents the response from the work item type states API
+type WorkItemTypeStatesResponse struct {
+	Count int                 `json:"count"`
+	Value []WorkItemTypeState `json:"value"`
+}
+
+// WorkItem represents a work item in Azure DevOps
+type WorkItem struct {
+	ID                 int            `json:"id"`
+	Rev                int            `json:"rev"`
+	Fields             WorkItemFields `json:"fields"`
+	URL                string         `json:"url"`
+	ProjectName        string         `json:"-"` // Set by MultiClient, not from API
+	ProjectDisplayName string         `json:"-"` // Set by MultiClient, display name for UI
+}
+
+// WorkItemFields represents the fields of a work item
+type WorkItemFields struct {
+	Title         string    `json:"System.Title"`
+	State         string    `json:"System.State"`
+	WorkItemType  string    `json:"System.WorkItemType"`
+	AssignedTo    *Identity `json:"System.AssignedTo"`
+	Priority      int       `json:"Microsoft.VSTS.Common.Priority"`
+	ChangedDate   time.Time `json:"System.ChangedDate"`
+	IterationPath string    `json:"System.IterationPath"`
+	Description   string    `json:"System.Description"`
+	ReproSteps    string    `json:"Microsoft.VSTS.TCM.ReproSteps"`
+	Tags          string    `json:"System.Tags"`
+
+	StoryPoints     float64   `json:"Microsoft.VSTS.Scheduling.StoryPoints"`
+	StateChangeDate time.Time `json:"Microsoft.VSTS.Common.StateChangeDate"`
+	ActivatedDate   time.Time `json:"Microsoft.VSTS.Common.ActivatedDate"`
+	ClosedDate      time.Time `json:"Microsoft.VSTS.Common.ClosedDate"`
+	CreatedDate     time.Time `json:"System.CreatedDate"`
+}
+
+// WorkItemReference represents a reference to a work item from WIQL queries
+type WorkItemReference struct {
+	ID  int    `json:"id"`
+	URL string `json:"url"`
+}
+
+// WIQLResponse represents the response from a WIQL query
+type WIQLResponse struct {
+	WorkItems []WorkItemReference `json:"workItems"`
+}
+
+// WorkItemsResponse represents the response from getting work items
+type WorkItemsResponse struct {
+	Count int        `json:"count"`
+	Value []WorkItem `json:"value"`
+}
+
+// StateIcon returns an icon for the work item state
+// Workflow: New → Active → Resolved/Ready for Test → Closed
+func (wi *WorkItem) StateIcon() string {
+	stateLower := strings.ToLower(wi.Fields.State)
+
+	switch {
+	case stateLower == "new":
+		return "○"
+	case stateLower == "active":
+		return "◐"
+	case stateLower == "resolved" || strings.Contains(stateLower, "ready"):
+		return "●"
+	case stateLower == "closed":
+		return "✓"
+	case stateLower == "removed":
+		return "✗"
+	default:
+		return "○"
+	}
+}
+
+// EffectiveDescription returns the appropriate description field based on work item type.
+// Bugs use Microsoft.VSTS.TCM.ReproSteps; other types use System.Description.
+func (wi *WorkItem) EffectiveDescription() string {
+	if wi.Fields.WorkItemType == "Bug" && wi.Fields.ReproSteps != "" {
+		return wi.Fields.ReproSteps
+	}
+	return wi.Fields.Description
+}
+
+// TagList returns the tags as a trimmed slice, split on semicolons.
+// Returns nil if there are no tags.
+func (wi *WorkItem) TagList() []string {
+	if wi.Fields.Tags == "" {
+		return nil
+	}
+	raw := strings.Split(wi.Fields.Tags, ";")
+	tags := make([]string, 0, len(raw))
+	for _, t := range raw {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			tags = append(tags, t)
+		}
+	}
+	return tags
+}
+
+// TimeInCurrentState reports how long the work item has been in its current state.
+// Returns 0 when StateChangeDate is unset.
+func (wi *WorkItem) TimeInCurrentState(now time.Time) time.Duration {
+	if wi.Fields.StateChangeDate.IsZero() {
+		return 0
+	}
+	return now.Sub(wi.Fields.StateChangeDate)
+}
+
+// EffectivePoints returns the work item's story-point estimate.
+func (wi *WorkItem) EffectivePoints() float64 {
+	return wi.Fields.StoryPoints
+}
+
+// IsCompletedSince reports whether the item is Closed and was closed strictly
+// after `start`. Items with a zero ClosedDate or a non-Closed state return false.
+func (wi *WorkItem) IsCompletedSince(start time.Time) bool {
+	return strings.EqualFold(wi.Fields.State, "Closed") &&
+		!wi.Fields.ClosedDate.IsZero() &&
+		wi.Fields.ClosedDate.After(start)
+}
+
+// AssignedToName returns the display name of the assigned user, or "-" if unassigned
+func (wi *WorkItem) AssignedToName() string {
+	if wi.Fields.AssignedTo == nil {
+		return "-"
+	}
+	return wi.Fields.AssignedTo.DisplayName
+}
+
+// QueryWorkItemIDs executes a WIQL query and returns the work item IDs
+// top: maximum number of results to return
+func (c *Client) QueryWorkItemIDs(query string, top int) ([]int, error) {
+	path := fmt.Sprintf("/wit/wiql?api-version=7.1&$top=%d", top)
+
+	payload := fmt.Sprintf(`{"query": %s}`, escapeJSONString(query))
+	body, err := c.post(path, strings.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute WIQL query: %w", err)
+	}
+
+	var response WIQLResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("failed to parse Azure DevOps API response for work item query: %w. "+
+			"This may indicate an API structure change. Please check for updates or report this issue", err)
+	}
+
+	ids := make([]int, len(response.WorkItems))
+	for i, wi := range response.WorkItems {
+		ids[i] = wi.ID
+	}
+
+	return ids, nil
+}
+
+// GetWorkItems retrieves work items by their IDs
+// Azure DevOps supports up to 200 IDs per request
+func (c *Client) GetWorkItems(ids []int) ([]WorkItem, error) {
+	if len(ids) == 0 {
+		return []WorkItem{}, nil
+	}
+
+	// Convert IDs to comma-separated string
+	idStrs := make([]string, len(ids))
+	for i, id := range ids {
+		idStrs[i] = strconv.Itoa(id)
+	}
+	idsParam := strings.Join(idStrs, ",")
+
+	// Specify fields to retrieve
+	fields := strings.Join([]string{
+		"System.Id",
+		"System.Title",
+		"System.State",
+		"System.WorkItemType",
+		"System.AssignedTo",
+		"Microsoft.VSTS.Common.Priority",
+		"System.ChangedDate",
+		"System.IterationPath",
+		"System.Description",
+		"Microsoft.VSTS.TCM.ReproSteps",
+		"System.Tags",
+		"Microsoft.VSTS.Scheduling.StoryPoints",
+		"Microsoft.VSTS.Common.StateChangeDate",
+		"Microsoft.VSTS.Common.ActivatedDate",
+		"Microsoft.VSTS.Common.ClosedDate",
+		"System.CreatedDate",
+	}, ",")
+
+	path := fmt.Sprintf("/wit/workitems?ids=%s&fields=%s&api-version=7.1", idsParam, fields)
+
+	body, err := c.get(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get work items: %w", err)
+	}
+
+	var response WorkItemsResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("failed to parse Azure DevOps API response for work items: %w. "+
+			"This may indicate an API structure change. Please check for updates or report this issue", err)
+	}
+
+	return response.Value, nil
+}
+
+// ListWorkItems retrieves work items assigned to the current user
+// top: maximum number of work items to return (max 50 enforced)
+func (c *Client) ListWorkItems(top int) ([]WorkItem, error) {
+	// Enforce cap at 50
+	if top > 50 {
+		top = 50
+	}
+
+	// WIQL query to get active work items assigned to current user
+	// @project scopes to the project in the API URL context, preventing
+	// duplicates when multiple project clients query simultaneously
+	query := `SELECT [System.Id] FROM WorkItems
+WHERE [System.TeamProject] = @project
+  AND [System.State] <> 'Closed'
+  AND [System.State] <> 'Removed'
+ORDER BY [System.ChangedDate] DESC`
+
+	ids, err := c.QueryWorkItemIDs(query, top)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ids) == 0 {
+		return []WorkItem{}, nil
+	}
+
+	return c.GetWorkItems(ids)
+}
+
+// ListMyWorkItems retrieves work items assigned to the authenticated user
+// using the @Me WIQL macro, which Azure DevOps resolves server-side from the PAT.
+// top: maximum number of work items to return (max 50 enforced)
+func (c *Client) ListMyWorkItems(top int) ([]WorkItem, error) {
+	if top > 50 {
+		top = 50
+	}
+
+	query := `SELECT [System.Id] FROM WorkItems
+WHERE [System.TeamProject] = @project
+  AND [System.AssignedTo] = @Me
+  AND [System.State] <> 'Closed'
+  AND [System.State] <> 'Removed'
+ORDER BY [System.ChangedDate] DESC`
+
+	ids, err := c.QueryWorkItemIDs(query, top)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ids) == 0 {
+		return []WorkItem{}, nil
+	}
+
+	return c.GetWorkItems(ids)
+}
+
+// ListRecentlyMentionedWorkItems retrieves work items the @RecentMentions
+// WIQL macro considers recently mentioning the authenticated user, scoped to
+// this client's project. This is stage 1 of decision 3's two-stage @mention
+// notification source (see SourceMentioned in
+// notifications_source_mentioned.go): it only narrows candidates and is
+// deliberately allowed to over-match, because stage 2 re-filters every
+// candidate against the comments API's mentions[].targetId before anything
+// reaches the feed — @RecentMentions carries no per-mention timestamp, so it
+// cannot answer "was I mentioned" on its own.
+//
+// Confirmed working over REST by task 1's spike against a live org (phase-2
+// notifications spec, "Probe results" (a)) — Microsoft's macro reference
+// lists @RecentMentions among macros documented as "web-portal-only", but
+// that claim did not hold for @Me either and does not hold here. Decision
+// 3's System.History CONTAINS WORDS fallback is therefore not implemented.
+//
+// The query's ORDER BY only sorts the ids QueryWorkItemIDs returns — the
+// GET /wit/workitems batch endpoint GetWorkItems calls next returns
+// response.Value in its own order, unrelated to the order the ids were
+// requested in. So the result below is explicitly re-sorted by
+// Fields.ChangedDate descending after the batch fetch, matching every other
+// multi-item work-item fetch in this package (MultiClient.ListWorkItems,
+// .MetricsWorkItems, .ListMyWorkItems all do the same after their own batch
+// calls). Stage 2 (SourceMentioned's confirmAndMapMentions) relies on this
+// order to fetch comments for the most-recently-changed candidates first,
+// and boundMentionCandidates truncates from the tail of this order when a
+// project's candidate count exceeds the fan-out bound, so an unsorted
+// result would silently drop the wrong candidates under load.
+//
+// top: maximum number of candidate work items to return (max 50 enforced,
+// matching every other WIQL caller in this file).
+func (c *Client) ListRecentlyMentionedWorkItems(top int) ([]WorkItem, error) {
+	if top > 50 {
+		top = 50
+	}
+
+	query := `SELECT [System.Id] FROM WorkItems
+WHERE [System.TeamProject] = @project AND [System.Id] IN (@RecentMentions)
+ORDER BY [System.ChangedDate] DESC`
+
+	ids, err := c.QueryWorkItemIDs(query, top)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ids) == 0 {
+		return []WorkItem{}, nil
+	}
+
+	items, err := c.GetWorkItems(ids)
+	if err != nil {
+		return nil, err
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].Fields.ChangedDate.After(items[j].Fields.ChangedDate)
+	})
+
+	return items, nil
+}
+
+// ListRecentlyAssignedWorkItems retrieves work items assigned to the
+// authenticated user (@Me) whose System.ChangedDate falls within the last
+// lookbackDays days, scoped to this client's project. This is the entire
+// query behind the "recently assigned work items" notification source (task
+// 6 of the phase-2 notifications spec, SourceAssigned in
+// notifications_source_assigned.go): decision 6 chose this bounded lookback
+// window over a snapshot/delta design specifically because it is stateless
+// and idempotent — the same query run twice against unchanged data returns
+// the same ids in the same order, so a fresh install with an empty local
+// state file surfaces at most this window's worth of items rather than
+// flooding the feed with everything ever assigned.
+//
+// The query's ORDER BY only sorts the ids QueryWorkItemIDs returns — the
+// GET /wit/workitems batch endpoint GetWorkItems calls next returns
+// response.Value in its own order, unrelated to the order the ids were
+// requested in (see ListRecentlyMentionedWorkItems' doc comment for the full
+// explanation, and MultiClient.ListWorkItems/.MetricsWorkItems/
+// .ListMyWorkItems for the same fix applied elsewhere in this package). The
+// result below is explicitly re-sorted by Fields.ChangedDate descending
+// after the batch fetch to correct for that.
+//
+// lookbackDays is N in `[System.ChangedDate] >= @Today-N` — task 11 wires it
+// to notifications.azure.lookback_days; this method takes it as a plain
+// parameter and does no config lookups of its own. A negative value is
+// clamped to 0 rather than interpolated as-is: `@Today--5` is malformed
+// WIQL and would fail every project's query with HTTP 400, degrading this
+// source to nothing (convention 11's habit, applied to a query parameter
+// rather than an id).
+//
+// The state clause mirrors ListMyWorkItems (workitems.go:261-266) exactly:
+// without it, closing a work item is itself a revision that advances
+// System.ChangedDate, so the one action that completes an assigned item is
+// also the one that guarantees it matches this query again on the next
+// poll — inverting decision 7's auto-expiry by making "done" the trigger
+// for "unread".
+//
+// top: maximum number of work items to return (max 50 enforced, matching
+// every other WIQL caller in this file).
+func (c *Client) ListRecentlyAssignedWorkItems(lookbackDays, top int) ([]WorkItem, error) {
+	if top > 50 {
+		top = 50
+	}
+	if lookbackDays < 0 {
+		lookbackDays = 0
+	}
+
+	query := fmt.Sprintf(`SELECT [System.Id] FROM WorkItems
+WHERE [System.TeamProject] = @project
+  AND [System.AssignedTo] = @Me
+  AND [System.ChangedDate] >= @Today-%d
+  AND [System.State] <> 'Closed'
+  AND [System.State] <> 'Removed'
+ORDER BY [System.ChangedDate] DESC`, lookbackDays)
+
+	ids, err := c.QueryWorkItemIDs(query, top)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ids) == 0 {
+		return []WorkItem{}, nil
+	}
+
+	items, err := c.GetWorkItems(ids)
+	if err != nil {
+		return nil, err
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].Fields.ChangedDate.After(items[j].Fields.ChangedDate)
+	})
+
+	return items, nil
+}
+
+// GetWorkItemTypeStates retrieves the available states for a work item type.
+// States in the "Removed" category are excluded since they are not typical user transitions.
+func (c *Client) GetWorkItemTypeStates(workItemType string) ([]WorkItemTypeState, error) {
+	path := fmt.Sprintf("/wit/workitemtypes/%s/states?api-version=7.1", workItemType)
+
+	body, err := c.get(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get work item type states: %w", err)
+	}
+
+	var response WorkItemTypeStatesResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("failed to parse work item type states response: %w", err)
+	}
+
+	// Filter out "Removed" category states
+	states := make([]WorkItemTypeState, 0, len(response.Value))
+	for _, s := range response.Value {
+		if s.Category != "Removed" {
+			states = append(states, s)
+		}
+	}
+
+	return states, nil
+}
+
+// UpdateWorkItemState updates the state of a work item using JSON Patch.
+func (c *Client) UpdateWorkItemState(id int, state string) error {
+	path := fmt.Sprintf("/wit/workitems/%d?api-version=7.1", id)
+
+	payload := fmt.Sprintf(`[{"op":"replace","path":"/fields/System.State","value":%s}]`, escapeJSONString(state))
+	_, err := c.doRequestWithContentType("PATCH", path, strings.NewReader(payload), "application/json-patch+json")
+	if err != nil {
+		return fmt.Errorf("failed to update work item state: %w", err)
+	}
+
+	return nil
+}
+
+// CreateWorkItem creates a work item with the given title and optional
+// description.
+func (c *Client) CreateWorkItem(workItemType, title, description, assignedTo string) (*WorkItem, error) {
+	workItemType = strings.TrimSpace(workItemType)
+	title = strings.TrimSpace(title)
+	if workItemType == "" {
+		return nil, fmt.Errorf("work item type cannot be empty")
+	}
+	if title == "" {
+		return nil, fmt.Errorf("work item title cannot be empty")
+	}
+
+	patch := []struct {
+		Op    string `json:"op"`
+		Path  string `json:"path"`
+		Value string `json:"value"`
+	}{
+		{Op: "add", Path: "/fields/System.Title", Value: title},
+	}
+	if description = strings.TrimSpace(description); description != "" {
+		descriptionField := "System.Description"
+		if strings.EqualFold(workItemType, "Bug") {
+			descriptionField = "Microsoft.VSTS.TCM.ReproSteps"
+		}
+		patch = append(patch, struct {
+			Op    string `json:"op"`
+			Path  string `json:"path"`
+			Value string `json:"value"`
+		}{Op: "add", Path: "/fields/" + descriptionField, Value: description})
+	}
+	if assignedTo = strings.TrimSpace(assignedTo); assignedTo != "" {
+		patch = append(patch, struct {
+			Op    string `json:"op"`
+			Path  string `json:"path"`
+			Value string `json:"value"`
+		}{Op: "add", Path: "/fields/System.AssignedTo", Value: assignedTo})
+	}
+
+	payload, err := json.Marshal(patch)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode work item: %w", err)
+	}
+	path := fmt.Sprintf("/wit/workitems/$%s?api-version=7.1", url.PathEscape(workItemType))
+	body, err := c.doRequestWithContentType("POST", path, strings.NewReader(string(payload)), "application/json-patch+json")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create work item: %w", err)
+	}
+
+	var workItem WorkItem
+	if err := json.Unmarshal(body, &workItem); err != nil {
+		return nil, fmt.Errorf("failed to parse Azure DevOps API response for created work item: %w", err)
+	}
+	return &workItem, nil
+}

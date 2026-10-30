@@ -1,0 +1,397 @@
+package components
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/hari-incoming/hazdo/internal/ui/styles"
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+func TestHelpModal_New(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+
+	if h == nil {
+		t.Fatal("expected non-nil HelpModal")
+	}
+	if h.IsVisible() {
+		t.Error("help modal should be hidden by default")
+	}
+}
+
+func TestHelpModal_Show(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.Show()
+
+	if !h.IsVisible() {
+		t.Error("help modal should be visible after Show()")
+	}
+}
+
+func TestHelpModal_Hide(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.Show()
+	h.Hide()
+
+	if h.IsVisible() {
+		t.Error("help modal should be hidden after Hide()")
+	}
+}
+
+func TestHelpModal_Toggle(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+
+	h.Toggle()
+	if !h.IsVisible() {
+		t.Error("should be visible after first toggle")
+	}
+
+	h.Toggle()
+	if h.IsVisible() {
+		t.Error("should be hidden after second toggle")
+	}
+}
+
+func TestHelpModal_View_WhenHidden(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetSize(80, 24)
+
+	view := h.View()
+
+	if view != "" {
+		t.Error("view should be empty when hidden")
+	}
+}
+
+func TestHelpModal_View_ContainsTitle(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetSize(80, 24)
+	h.Show()
+
+	view := strings.ToLower(h.View())
+
+	if !strings.Contains(view, "keyboard shortcuts") {
+		t.Error("view should contain the 'Keyboard Shortcuts' title")
+	}
+}
+
+func TestHelpModal_View_ContainsScopes(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetSize(80, 60)
+	h.SetScopes([]string{"Project A", "octo/repo"})
+	h.Show()
+
+	view := h.View()
+
+	if !strings.Contains(view, "Scopes:") {
+		t.Error("view should contain a 'Scopes:' label in the Info section")
+	}
+	for _, s := range []string{"Project A", "octo/repo"} {
+		if !strings.Contains(view, s) {
+			t.Errorf("view should list configured scope %q", s)
+		}
+	}
+}
+
+func TestHelpModal_View_NoScopesLineWhenUnset(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetSize(80, 60)
+	h.Show()
+
+	if strings.Contains(h.View(), "Scopes:") {
+		t.Error("view should not contain a 'Scopes:' label when no scopes are set")
+	}
+}
+
+func TestHelpModal_View_ContainsKeybindings(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetSize(80, 60)
+	h.Show()
+
+	view := h.View()
+
+	// Should contain common keybindings
+	keybindings := []string{"quit", "refresh", "move", "esc"}
+	for _, kb := range keybindings {
+		if !strings.Contains(strings.ToLower(view), kb) {
+			t.Errorf("view should contain '%s' keybinding", kb)
+		}
+	}
+}
+
+func TestHelpModal_View_ContainsCodeReviewSection(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetSize(80, 60)
+	h.Show()
+
+	view := h.View()
+	lower := strings.ToLower(view)
+
+	if !strings.Contains(lower, "code review") {
+		t.Error("help modal should contain 'Code Review' section")
+	}
+	for _, desc := range []string{"create new comment", "reply to nearest thread", "resolve nearest thread"} {
+		if !strings.Contains(lower, desc) {
+			t.Errorf("help modal should contain code review binding: %s", desc)
+		}
+	}
+}
+
+func TestHelpModal_View_ContainsLogViewerSection(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetSize(80, 60)
+	h.Show()
+
+	view := h.View()
+	lower := strings.ToLower(view)
+
+	if !strings.Contains(lower, "log viewer") {
+		t.Error("help modal should contain 'Log Viewer' section")
+	}
+	if !strings.Contains(lower, "go to top") {
+		t.Error("help modal should contain 'Go to top' binding")
+	}
+	if !strings.Contains(lower, "go to bottom") {
+		t.Error("help modal should contain 'Go to bottom' binding")
+	}
+	if !strings.Contains(view, "Search log output") {
+		t.Error("help modal should contain the log search binding")
+	}
+	if !strings.Contains(view, "Next / previous search match") {
+		t.Error("help modal should contain log search navigation bindings")
+	}
+	if !strings.Contains(view, "Copy full log to clipboard") {
+		t.Error("help modal should contain the copy-log binding")
+	}
+}
+
+func TestHelpModal_Update_EscHides(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.Show()
+
+	h, _ = h.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	if h.IsVisible() {
+		t.Error("esc should hide the modal")
+	}
+}
+
+func TestHelpModal_Update_QuestionMarkHides(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.Show()
+
+	h, _ = h.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+
+	if h.IsVisible() {
+		t.Error("? should hide the modal when visible")
+	}
+}
+
+func TestHelpModal_Update_QHides(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.Show()
+
+	h, _ = h.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+
+	if h.IsVisible() {
+		t.Error("q should hide the modal")
+	}
+}
+
+func TestHelpModal_SetSize_AffectsViewCentering(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.Show()
+
+	// Render without size — no centering applied
+	h.SetSize(0, 0)
+	viewNoSize := h.View()
+
+	// Render with a large terminal size — centering should add leading whitespace
+	h.SetSize(200, 60)
+	viewWithSize := h.View()
+
+	if viewWithSize == viewNoSize {
+		t.Error("setting a large terminal size should change the rendered output (centering)")
+	}
+
+	// The centered view should have leading blank lines (vertical centering)
+	if !strings.HasPrefix(viewWithSize, "\n") {
+		t.Error("centered view should start with blank lines for vertical padding")
+	}
+}
+
+func TestHelpModal_ScrollableWhenContentOverflows(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	// Small terminal — default sections won't all fit.
+	h.SetSize(80, 12)
+	h.Show()
+
+	before := h.View()
+
+	// Scroll down
+	h, _ = h.Update(tea.KeyMsg{Type: tea.KeyDown})
+	after := h.View()
+
+	if before == after {
+		t.Error("expected modal view to change after scrolling down when content overflows")
+	}
+}
+
+func TestHelpModal_ScrollKeysDoNotCloseWhenScrollable(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetSize(80, 12)
+	h.Show()
+
+	h, _ = h.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if !h.IsVisible() {
+		t.Error("down key should not close the modal when scrollable")
+	}
+
+	h, _ = h.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if !h.IsVisible() {
+		t.Error("'j' key should not close the modal when scrollable")
+	}
+
+	h, _ = h.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	if !h.IsVisible() {
+		t.Error("pgdn key should not close the modal when scrollable")
+	}
+}
+
+func TestHelpModal_FitsInTerminalHeight(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetSize(80, 12)
+	h.Show()
+
+	view := h.View()
+	lines := strings.Split(strings.TrimRight(view, "\n"), "\n")
+
+	if len(lines) > 12 {
+		t.Errorf("help modal output is %d lines but terminal height is 12 — modal must fit within available height", len(lines))
+	}
+}
+
+func TestHelpModal_EscClosesEvenWhenScrollable(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetSize(80, 12)
+	h.Show()
+
+	h, _ = h.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if h.IsVisible() {
+		t.Error("esc should still close the modal when scrollable")
+	}
+}
+
+func TestHelpModal_View_ContainsOpenInBrowserBinding(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetSize(80, 60)
+	h.Show()
+
+	view := h.View()
+	lower := strings.ToLower(view)
+
+	if !strings.Contains(lower, "open in browser") {
+		t.Error("help modal should describe the 'open in browser' action")
+	}
+	// The key should also be present somewhere in the rendered modal.
+	if !strings.Contains(view, "o") {
+		t.Error("help modal should list the 'o' key for open in browser")
+	}
+}
+
+func TestHelpModal_AddSection(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.AddSection("Custom", []HelpBinding{
+		{Key: "x", Description: "do something"},
+	})
+	h.SetSize(80, 60)
+	h.Show()
+
+	view := h.View()
+
+	if !strings.Contains(view, "Custom") {
+		t.Error("view should contain custom section")
+	}
+	if !strings.Contains(view, "do something") {
+		t.Error("view should contain custom binding description")
+	}
+}
+
+func TestHelpModal_SetConfigPath_ShowsInView(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetConfigPath("/home/user/.config/azdo-tui/config.yaml")
+	h.SetSize(80, 60)
+	h.Show()
+
+	view := h.View()
+
+	if !strings.Contains(view, "config.yaml") {
+		t.Error("help modal should display config path when set")
+	}
+}
+
+func TestHelpModal_NoConfigPath_NotShown(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetSize(80, 60)
+	h.Show()
+
+	view := h.View()
+
+	if strings.Contains(view, "Config") {
+		t.Error("help modal should not show config section when no path set")
+	}
+}
+
+func TestHelpModal_SetVersionInfo_ShowsInView(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetVersionInfo("1.2.3 (abc1234)")
+	h.SetSize(80, 60)
+	h.Show()
+
+	view := h.View()
+
+	if !strings.Contains(view, "1.2.3") {
+		t.Error("help modal should display version when set")
+	}
+	if !strings.Contains(view, "abc1234") {
+		t.Error("help modal should display commit hash when set")
+	}
+}
+
+func TestHelpModal_EmptyVersionInfo_NotShown(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetSize(80, 60)
+	h.Show()
+
+	view := h.View()
+
+	if strings.Contains(view, "Version") {
+		t.Error("help modal should not show version when not set")
+	}
+}
+
+func TestHelpModal_VersionAndConfig_BothInInfoSection(t *testing.T) {
+	h := NewHelpModal(styles.DefaultStyles())
+	h.SetVersionInfo("2.0.0 (def5678)")
+	h.SetConfigPath("/home/user/.config/azdo-tui/config.yaml")
+	h.SetSize(80, 60)
+	h.Show()
+
+	view := h.View()
+
+	if !strings.Contains(view, "2.0.0") {
+		t.Error("help modal should show version in info section")
+	}
+	if !strings.Contains(view, "config.yaml") {
+		t.Error("help modal should show config path in info section")
+	}
+	// Both should be under the same "Info" heading
+	infoIdx := strings.Index(view, "Info")
+	if infoIdx == -1 {
+		t.Fatal("help modal should have an Info section")
+	}
+	afterInfo := view[infoIdx:]
+	if !strings.Contains(afterInfo, "2.0.0") || !strings.Contains(afterInfo, "config.yaml") {
+		t.Error("both version and config should appear after the Info heading")
+	}
+}
